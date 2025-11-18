@@ -11,10 +11,11 @@ const app = express();
 app.use(cors({
   origin: [
     "https://excellent-range-296913.web.app",
-    "https://excellent-range-296913.firebaseapp.com",
+    "https://excellent-range-296913.firebaseapp.com"
   ],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
 }));
 
 app.use(bodyParser.json());
