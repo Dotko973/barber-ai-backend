@@ -79,19 +79,24 @@ app.get("/api/test-calendar", async (req, res) => {
   }
 });
 
-// ===============================
-// SSE TEST
-// ===============================
 
+// SSE endpoint
 app.get("/api/events", (req, res) => {
+  const origin = req.headers.origin;
+
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true"
   });
 
-  const data = JSON.stringify({ type: "log", data: { message: "SSE stream connected." } });
+  const data = JSON.stringify({
+    type: "log",
+    data: { message: "SSE stream connected." }
+  });
+
   res.write(`data: ${data}\n\n`);
 
   req.on("close", () => {});
