@@ -1,0 +1,45 @@
+name: Deploy Node App to Azure Web App
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (if needed)
+        run: |
+          echo "No build step required"
+
+      - name: Zip artifact for deployment
+        run: zip -r release.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: node-app
+          path: release.zip
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: Barber-ai
+          package: release.zip
