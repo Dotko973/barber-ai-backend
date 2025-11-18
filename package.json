@@ -1,0 +1,26 @@
+{
+  "type": "module",
+  "name": "barbershop-ai-backend",
+  "version": "1.0.0",
+  "description": "Backend service for the Barbershop AI Voice Assistant",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "build": "echo 'No build step needed for backend.'"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.14.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "encodeurl": "^2.0.0",
+    "express": "^4.19.2",
+    "google-auth-library": "^9.11.0",
+    "googleapis": "^126.0.1",
+    "twilio": "^5.10.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
