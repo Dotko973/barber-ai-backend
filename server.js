@@ -82,16 +82,18 @@ app.get("/api/test-calendar", async (req, res) => {
 
 // SSE endpoint
 app.get("/api/events", (req, res) => {
-  const origin = req.headers.origin;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Credentials": "true"
+
+    // Azure App Service requires "*" for SSE CORS
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Credentials": "false"
   });
 
+  // Send initial ping message
   const data = JSON.stringify({
     type: "log",
     data: { message: "SSE stream connected." }
@@ -99,7 +101,10 @@ app.get("/api/events", (req, res) => {
 
   res.write(`data: ${data}\n\n`);
 
-  req.on("close", () => {});
+  // Keep the SSE open
+  req.on("close", () => {
+    // cleanup (if needed)
+  });
 });
 
 // ===============================
