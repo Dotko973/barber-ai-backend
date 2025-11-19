@@ -9,29 +9,40 @@ import { google } from "googleapis";
 const app = express();
 
 // ----------------------------------------------------
-// CORS CONFIG
+// GLOBAL CORS CONFIG (Final, Works on Azure + SSE)
 // ----------------------------------------------------
+
 const allowedOrigins = [
   "http://localhost:5173",
   "https://excellent-range-296913.web.app",
-  "https://excellent-range-296913.firebaseapp.com",
+  "https://excellent-range-296913.firebaseapp.com"
 ];
 
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*"); // allow everything (frontend dev mode & Azure)
+  const origin = req.headers.origin;
+
+  // Allow only known frontends
+  if (origin && allowedOrigins.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+
+  // Azure + frontend dev mode safety fallback
+  if (!origin) {
+    res.header("Access-Control-Allow-Origin", "*");
+  }
+
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  
-  // Required for some browsers
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Vary", "Origin");
+
+  // If OPTIONS → return immediately (preflight)
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
-  
+
   next();
 });
-
-// Handle preflight requests explicitly (good for Azure)
-app.options("*", cors());
 
 // Parse JSON bodies
 app.use(bodyParser.json());
