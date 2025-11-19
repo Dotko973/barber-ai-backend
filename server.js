@@ -8,16 +8,36 @@ import { google } from "googleapis";
 // Create Express app
 const app = express();
 
-app.use(cors({
-  origin: [
-    "https://excellent-range-296913.web.app",
-    "https://excellent-range-296913.firebaseapp.com"
-  ],
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true
-}));
+// ----------------------------------------------------
+// CORS CONFIG
+// ----------------------------------------------------
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://excellent-range-296913.web.app",
+  "https://excellent-range-296913.firebaseapp.com",
+];
 
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow non-browser tools (no origin) and our known frontends
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn("❌ CORS blocked origin:", origin);
+        callback(null, false);
+      }
+    },
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  })
+);
+
+// Handle preflight requests explicitly (good for Azure)
+app.options("*", cors());
+
+// Parse JSON bodies
 app.use(bodyParser.json());
 
 // Fix "__dirname" for ES Modules
@@ -29,7 +49,7 @@ app.get("/", (req, res) => {
   res.send("Barbershop backend running on Azure App Service");
 });
 
-// ✅ Added API route for Firebase Hosting proxy
+// ✅ Health-check API root (Firebase / frontend proxy-friendly)
 app.get("/api", (req, res) => {
   res.json({ status: "Barbershop backend running on Azure App Service" });
 });
@@ -38,7 +58,7 @@ app.get("/api", (req, res) => {
 app.get("/api/appointments", (req, res) => {
   const sampleAppointments = [
     { id: 1, customerName: "John Doe", date: "2025-11-01", time: "10:00 AM" },
-    { id: 2, customerName: "Jane Smith", date: "2025-11-02", time: "2:00 PM" }
+    { id: 2, customerName: "Jane Smith", date: "2025-11-02", time: "2:00 PM" },
   ];
   res.json(sampleAppointments);
 });
@@ -54,7 +74,7 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN
+  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
 });
 
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
@@ -64,7 +84,7 @@ console.log("OAuth ENV CHECK:", {
   client_id: !!process.env.GOOGLE_CLIENT_ID,
   secret: !!process.env.GOOGLE_CLIENT_SECRET,
   refresh: !!process.env.GOOGLE_REFRESH_TOKEN,
-  redirect: process.env.GOOGLE_REDIRECT_URI
+  redirect: process.env.GOOGLE_REDIRECT_URI,
 });
 
 // ===============================
@@ -75,35 +95,54 @@ app.get("/api/test-calendar", async (req, res) => {
   if (calendar) {
     res.json({ success: true, message: "Calendar service is ready." });
   } else {
-    res.status(500).json({ success: false, error: "Calendar service is not initialized." });
+    res
+      .status(500)
+      .json({ success: false, error: "Calendar service is not initialized." });
   }
 });
 
+// ===============================
+// SSE EVENTS ENDPOINT
+// ===============================
 
-// SSE endpoint
 app.get("/api/events", (req, res) => {
+  // CORS for SSE – global cors() has already run, but we add a safety net:
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
 
-    // Azure App Service requires "*" for SSE CORS
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Credentials": "false"
-  });
+  // If available, flush headers immediately
+  if (res.flushHeaders) {
+    res.flushHeaders();
+  }
 
-  // Send initial ping message
-  const data = JSON.stringify({
+  const send = (payload) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  // Initial log so the frontend knows SSE is connected
+  send({
     type: "log",
-    data: { message: "SSE stream connected." }
+    data: { message: "SSE stream connected." },
   });
 
-  res.write(`data: ${data}\n\n`);
+  // Optional heartbeat to keep connection alive on Azure
+  const heartbeat = setInterval(() => {
+    send({
+      type: "log",
+      data: { message: "heartbeat" },
+    });
+  }, 25000);
 
-  // Keep the SSE open
   req.on("close", () => {
-    // cleanup (if needed)
+    clearInterval(heartbeat);
+    res.end();
   });
 });
 
@@ -122,12 +161,12 @@ app.post("/create-event", async (req, res) => {
       summary: `Appointment with ${customerName}`,
       description: `Barbershop appointment for ${customerName}`,
       start: { dateTime: `${date}T${time}:00`, timeZone: "Europe/Sofia" },
-      end: { dateTime: `${date}T${time}:00`, timeZone: "Europe/Sofia" }
+      end: { dateTime: `${date}T${time}:00`, timeZone: "Europe/Sofia" },
     };
 
     const response = await calendar.events.insert({
       calendarId: "primary",
-      resource: event
+      resource: event,
     });
 
     res.json({ success: true, eventId: response.data.id });
@@ -150,7 +189,7 @@ app.post("/cancel-event", async (req, res) => {
 
     await calendar.events.delete({
       calendarId: "primary",
-      eventId: eventId
+      eventId: eventId,
     });
 
     res.json({ success: true });
@@ -167,7 +206,9 @@ app.post("/cancel-event", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`✅ Barbershop backend running on Azure App Service on port ${PORT}`);
+  console.log(
+    `✅ Barbershop backend running on Azure App Service on port ${PORT}`
+  );
 });
 
 
