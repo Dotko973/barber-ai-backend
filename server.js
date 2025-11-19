@@ -9,7 +9,7 @@ import { google } from "googleapis";
 const app = express();
 
 // ----------------------------------------------------
-// GLOBAL CORS CONFIG (simple, uses cors library)
+// GLOBAL CORS CONFIG (Final, works with Azure + localhost)
 // ----------------------------------------------------
 const allowedOrigins = [
   "http://localhost:5173",
@@ -20,19 +20,19 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow tools with no origin (curl, Postman, Azure health checks, etc.)
+      // Allow requests with no origin (curl, Postman, Azure health check)
       if (!origin) return callback(null, true);
 
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
 
-      console.warn("CORS blocked origin:", origin);
+      console.warn("❌ CORS blocked origin:", origin);
       return callback(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false, // we are NOT using cookies
+    credentials: false, // IMPORTANT → we do NOT use cookies
   })
 );
 
