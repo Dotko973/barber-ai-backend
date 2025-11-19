@@ -14,6 +14,7 @@ const allowedOrigins = [
   "http://localhost:5173",
   "https://excellent-range-296913.web.app",
   "https://excellent-range-296913.firebaseapp.com",
+  "https://barberai-backend.azurewebsites.net"  
 ];
 
 app.use(
