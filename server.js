@@ -200,9 +200,18 @@ app.post("/cancel-event", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(
-    `✅ Barbershop backend running on Azure App Service on port ${PORT}`
-  );
+    console.log(`
+=====================================================
+   🚀 Barbershop backend running on Azure App Service
+-----------------------------------------------------
+   ✔ PORT: ${PORT}
+   ✔ NODE_ENV: ${process.env.NODE_ENV || "not set"}
+   ✔ GOOGLE_CLIENT_ID: ${process.env.GOOGLE_CLIENT_ID ? "loaded" : "MISSING"}
+   ✔ GOOGLE_CLIENT_SECRET: ${process.env.GOOGLE_CLIENT_SECRET ? "loaded" : "MISSING"}
+   ✔ GOOGLE_REFRESH_TOKEN: ${process.env.GOOGLE_REFRESH_TOKEN ? "loaded" : "MISSING"}
+   ✔ GOOGLE_REDIRECT_URI: ${process.env.GOOGLE_REDIRECT_URI || "MISSING"}
+=====================================================
+`);
 });
 
 
