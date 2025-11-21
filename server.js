@@ -8,28 +8,41 @@ import { google } from "googleapis";
 // Create Express app
 const app = express();
 
-// GLOBAL CORS CONFIG (Final, works with Azure + localhost)
-// --------------------------------------------------------
+// ----------------------------------------------------
+// GLOBAL CORS CONFIG (Final, Works on Azure + SSE)
+// ----------------------------------------------------
+
 const allowedOrigins = [
   "http://localhost:5173",
   "https://excellent-range-296913.web.app",
-  "https://excellent-range-296913.firebaseapp.com",
-  "https://barberai-backend.azurewebsites.net"  
+  "https://excellent-range-296913.firebaseapp.com"
 ];
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // ...
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,
-  })
-);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
 
-// Let browsers pre-flight any route
-app.options("*", cors());
+  // Allow only known frontends
+  if (origin && allowedOrigins.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+
+  // Azure + frontend dev mode safety fallback
+  if (!origin) {
+    res.header("Access-Control-Allow-Origin", "*");
+  }
+
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Vary", "Origin");
+
+  // If OPTIONS → return immediately (preflight)
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
 
 // Parse JSON bodies
 app.use(bodyParser.json());
@@ -200,18 +213,9 @@ app.post("/cancel-event", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`
-=====================================================
-   🚀 Barbershop backend running on Azure App Service
------------------------------------------------------
-   ✔ PORT: ${PORT}
-   ✔ NODE_ENV: ${process.env.NODE_ENV || "not set"}
-   ✔ GOOGLE_CLIENT_ID: ${process.env.GOOGLE_CLIENT_ID ? "loaded" : "MISSING"}
-   ✔ GOOGLE_CLIENT_SECRET: ${process.env.GOOGLE_CLIENT_SECRET ? "loaded" : "MISSING"}
-   ✔ GOOGLE_REFRESH_TOKEN: ${process.env.GOOGLE_REFRESH_TOKEN ? "loaded" : "MISSING"}
-   ✔ GOOGLE_REDIRECT_URI: ${process.env.GOOGLE_REDIRECT_URI || "MISSING"}
-=====================================================
-`);
+  console.log(
+    `✅ Barbershop backend running on Azure App Service on port ${PORT}`
+  );
 });
 
 
