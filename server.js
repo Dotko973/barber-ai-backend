@@ -9,40 +9,31 @@ import { google } from "googleapis";
 const app = express();
 
 // ----------------------------------------------------
-// GLOBAL CORS CONFIG (Final, Works on Azure + SSE)
+// GLOBAL CORS CONFIG (Standard Library Fix)
 // ----------------------------------------------------
 
 const allowedOrigins = [
-  "http://localhost:5173",
-  "https://excellent-range-296913.web.app",
+  "http://localhost:5173",                    // Your local frontend
+  "https://excellent-range-296913.web.app",   // Firebase Hosting
   "https://excellent-range-296913.firebaseapp.com"
 ];
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  // Allow only known frontends
-  if (origin && allowedOrigins.includes(origin)) {
-    res.header("Access-Control-Allow-Origin", origin);
-  }
-
-  // Azure + frontend dev mode safety fallback
-  if (!origin) {
-    res.header("Access-Control-Allow-Origin", "*");
-  }
-
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.header("Access-Control-Allow-Credentials", "true");
-  res.header("Vary", "Origin");
-
-  // If OPTIONS → return immediately (preflight)
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-
-  next();
-});
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl, or server-to-server)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log("Blocked by CORS:", origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true, // Essential for cookies/sessions if you use them
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 
 // Parse JSON bodies
 app.use(bodyParser.json());
@@ -56,7 +47,7 @@ app.get("/", (req, res) => {
   res.send("Barbershop backend running on Azure App Service");
 });
 
-// ✅ Health-check API root (Firebase / frontend proxy-friendly)
+// ✅ Health-check API root
 app.get("/api", (req, res) => {
   res.json({ status: "Barbershop backend running on Azure App Service" });
 });
@@ -86,7 +77,7 @@ oauth2Client.setCredentials({
 
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-// TEMP: Debug to verify environment variables (remove later)
+// TEMP: Debug to verify environment variables
 console.log("OAuth ENV CHECK:", {
   client_id: !!process.env.GOOGLE_CLIENT_ID,
   secret: !!process.env.GOOGLE_CLIENT_SECRET,
@@ -109,28 +100,27 @@ app.get("/api/test-calendar", async (req, res) => {
 });
 
 // ===============================
-// SSE EVENTS ENDPOINT
+// SSE EVENTS ENDPOINT (Fixed)
 // ===============================
 
 app.get("/api/events", (req, res) => {
-  // CORS for SSE – global cors() has already run, but we add a safety net:
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
+  // Global CORS middleware handles the Access-Control headers now.
+  // We only set SSE specific headers here.
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
 
-  // If available, flush headers immediately
+  // Azure-specific: flush headers immediately to keep connection open
   if (res.flushHeaders) {
     res.flushHeaders();
   }
 
   const send = (payload) => {
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    // Check if response is still writable before sending
+    if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
   };
 
   // Initial log so the frontend knows SSE is connected
@@ -139,14 +129,17 @@ app.get("/api/events", (req, res) => {
     data: { message: "SSE stream connected." },
   });
 
-  // Optional heartbeat to keep connection alive on Azure
+  // Heartbeat to keep connection alive on Azure (every 25s)
   const heartbeat = setInterval(() => {
-    send({
-      type: "log",
-      data: { message: "heartbeat" },
-    });
+    if (!res.writableEnded) {
+        send({
+            type: "log",
+            data: { message: "heartbeat" },
+        });
+    }
   }, 25000);
 
+  // Clean up on client disconnect
   req.on("close", () => {
     clearInterval(heartbeat);
     res.end();
