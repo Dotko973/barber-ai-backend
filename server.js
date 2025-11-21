@@ -14,6 +14,7 @@ const app = express();
 
 const allowedOrigins = [
   "http://localhost:5173",
+  "http://127.0.0.1:5173"
   "https://excellent-range-296913.web.app",
   "https://excellent-range-296913.firebaseapp.com"
 ];
