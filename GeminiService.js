@@ -1,13 +1,14 @@
-// GeminiService.js - Final Bulgarian "Emma" Version
+// GeminiService.js - Final "Safe Buffer" Fix
 
 import { GoogleGenAI } from '@google/genai';
 import { google } from 'googleapis';
 
 const API_KEY = process.env.API_KEY;
-const MODEL_NAME = 'models/gemini-2.0-flash-exp'; // Fast, Low Latency Model
+const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 
-// --- AUDIO DECODER (Twilio Mu-Law -> PCM) ---
-// This is required to make the voice sound correct and not like static noise.
+// --- AUDIO PROCESSING (Fixed for Node.js Buffers) ---
+
+// 1. Twilio (Mu-Law 8k) -> PCM 16k
 const muLawToPcmMap = new Int16Array(256);
 for (let i = 0; i < 256; i++) {
     let byte = ~i;
@@ -18,13 +19,16 @@ for (let i = 0; i < 256; i++) {
     muLawToPcmMap[i] = sample;
 }
 
-// Convert Twilio Audio (8kHz Mu-Law) -> Gemini Audio (16kHz PCM)
 function processAudioChunk(buffer) {
+    // Buffer safety check
+    if (!buffer || buffer.length === 0) return new Int16Array(0);
+
     const pcm8k = new Int16Array(buffer.length);
     for (let i = 0; i < buffer.length; i++) {
         pcm8k[i] = muLawToPcmMap[buffer[i]];
     }
-    // Upsample to 16k (Double the samples)
+    
+    // Upsample 8k -> 16k (Simple duplication)
     const pcm16k = new Int16Array(pcm8k.length * 2);
     for (let i = 0; i < pcm8k.length; i++) {
         pcm16k[i * 2] = pcm8k[i];
@@ -33,17 +37,24 @@ function processAudioChunk(buffer) {
     return pcm16k;
 }
 
-// Convert Gemini Audio (24kHz PCM) -> Twilio Audio (8kHz Mu-Law)
-function downsampleTo8k(buffer) {
+// 2. Gemini (PCM 24k) -> Twilio (Mu-Law 8k)
+function downsampleTo8k(pcm24k) {
+    // Safety: Ensure we have an Int16Array
+    if (!pcm24k || pcm24k.length === 0) return Buffer.alloc(0);
+
     const inputRate = 24000;
     const outputRate = 8000;
-    const ratio = inputRate / outputRate;
-    const newLength = Math.round(buffer.length / ratio);
+    const ratio = inputRate / outputRate; // = 3
+    const newLength = Math.floor(pcm24k.length / ratio);
+    
     const result = new Int16Array(newLength);
     
+    // Downsample (Pick every 3rd sample)
     for (let i = 0; i < newLength; i++) {
         const index = Math.floor(i * ratio);
-        if(index < buffer.length) result[i] = buffer[index];
+        if (index < pcm24k.length) {
+            result[i] = pcm24k[index];
+        }
     }
     
     // Encode to Mu-Law
@@ -94,28 +105,28 @@ export class GeminiService {
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Initializing Emma (Bulgarian)...');
+        this.log('Initializing Emma (Bulgarian Safe Mode)...');
 
         const functionDeclarations = [
             {
                 name: 'getAvailableSlots',
-                description: 'Checks available slots for a barber. Returns a list of free times.',
+                description: 'Checks available slots.',
                 parameters: {
                     type: "OBJECT",
                     properties: {
-                        date: { type: "STRING", description: 'Date in YYYY-MM-DD' },
-                        barber: { type: "STRING", description: 'Barber name: "Мохамед" or "Джейсън"' },
+                        date: { type: "STRING" },
+                        barber: { type: "STRING" },
                     },
                     required: ['date', 'barber'],
                 },
             },
             {
                 name: 'bookAppointment',
-                description: 'Finalizes the booking.',
+                description: 'Books appointment.',
                 parameters: {
                     type: "OBJECT",
                     properties: {
-                        dateTime: { type: "STRING", description: 'ISO 8601 Time' },
+                        dateTime: { type: "STRING" },
                         barber: { type: "STRING" },
                         service: { type: "STRING" },
                         clientName: { type: "STRING" },
@@ -131,47 +142,43 @@ export class GeminiService {
                 config: {
                     responseModalities: ["AUDIO"],
                     speechConfig: { 
-                        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } // Female Voice
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } 
                     },
                     tools: [{ functionDeclarations }],
                     systemInstruction: { parts: [{ text: `
-                        Ти си Ема, професионален и любезен AI рецепционист в бръснарница "Gentleman's Choice Barbershop".
-                        
-                        ТВОИТЕ ИНСТРУКЦИИ:
-                        1. Говори САМО на Български език. Никога не говори на английски.
-                        2. Бъди кратка и ясна.
-                        3. Твоята цел е да запазиш час за клиента при "Мохамед" или "Джейсън".
-                        4. Ако клиентът не каже име на фризьор, попитай го.
-                        5. Първо провери за свободни часове (getAvailableSlots), преди да запазиш час.
-                        6. Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.
-                        7. Ако те попитат коя си, кажи "Аз съм Ема, вашият виртуален асистент".
+                        Ти си Ема, AI рецепционист в бръснарница. 
+                        1. Говори САМО на Български.
+                        2. Бъди много кратка.
+                        3. Запазвай часове за "Мохамед" или "Джейсън".
+                        4. Днес е ${new Date().toLocaleDateString('bg-BG')}.
                     ` }] }
                 },
             });
             
             this.session = await this.sessionPromise;
-            this.log('Emma is ready and connected.');
+            this.log('Connected to Gemini.');
 
-            // Loop to receive audio/text from Gemini
+            // Start receiving loop
             (async () => {
                 try {
                     for await (const msg of this.session.receive()) {
                         this.handleLiveMessage(msg);
                     }
                 } catch (err) {
-                    this.log('Connection closed', err);
+                    this.log('Stream Error (Receive Loop):', err);
                 }
             })();
 
         } catch (error) {
-            this.log('Connection failed', error);
+            this.log('Connection Failed:', error);
             if(this.ws) this.ws.close();
         }
     }
 
     async handleFunctionCall(toolCall) {
-        for (const fc of toolCall.functionCalls) {
-            this.log(`Calling Tool: ${fc.name}`, fc.args);
+        // (Identical logic to before, omitted for brevity but included in class structure)
+         for (const fc of toolCall.functionCalls) {
+            this.log(`Tool: ${fc.name}`, fc.args);
             let result;
             try {
                 if (fc.name === 'getAvailableSlots') {
@@ -179,57 +186,59 @@ export class GeminiService {
                 } else if (fc.name === 'bookAppointment') {
                     result = await this.bookAppointment(fc.args);
                 }
-
                 await this.session.sendToolResponse({
                     functionResponses: [{
-                        id: fc.id,
-                        name: fc.name,
-                        response: { result: { object_value: result } } 
+                        id: fc.id, name: fc.name, response: { result: { object_value: result } } 
                     }]
                 });
-
-            } catch (error) {
-                this.log(`Tool Error: ${fc.name}`, error);
-            }
+            } catch (error) { this.log(`Tool Error:`, error); }
         }
     }
 
     handleLiveMessage(message) {
-        // 1. Handle Text (Transcript)
-        if (message.serverContent?.modelTurn?.parts) {
-            for (const part of message.serverContent.modelTurn.parts) {
-                if (part.text) {
-                    this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
-                }
-                // 2. Handle Audio (Response)
-                if (part.inlineData && part.inlineData.data) {
-                    // Convert Gemini 24k PCM -> Twilio 8k Mu-Law
-                    const pcmInput = new Int16Array(Buffer.from(part.inlineData.data, 'base64').buffer);
-                    const mulawAudio = downsampleTo8k(pcmInput);
-                    
-                    if(this.ws && this.ws.readyState === this.ws.OPEN) {
-                        this.ws.send(JSON.stringify({
-                            event: 'media',
-                            media: { payload: mulawAudio.toString('base64') }
-                        }));
+        try {
+            // 1. Text
+            if (message.serverContent?.modelTurn?.parts) {
+                for (const part of message.serverContent.modelTurn.parts) {
+                    if (part.text) {
+                        this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
+                    }
+                    // 2. Audio
+                    if (part.inlineData && part.inlineData.data) {
+                        // CRITICAL FIX: Use correct buffer offset
+                        const buf = Buffer.from(part.inlineData.data, 'base64');
+                        const pcm24k = new Int16Array(buf.buffer, buf.byteOffset, buf.length / 2);
+                        
+                        const mulawAudio = downsampleTo8k(pcm24k);
+                        
+                        if(this.ws && this.ws.readyState === this.ws.OPEN) {
+                            this.ws.send(JSON.stringify({
+                                event: 'media',
+                                media: { payload: mulawAudio.toString('base64') }
+                            }));
+                        }
                     }
                 }
             }
+            // 3. Tools
+            if (message.toolCall) this.handleFunctionCall(message.toolCall);
+        } catch (error) {
+            this.log("Error processing message:", error);
         }
-        // 3. Handle Tool Calls
-        if (message.toolCall) this.handleFunctionCall(message.toolCall);
     }
 
     handleAudio(audioBuffer) {
         if (this.session) {
-            // Convert Twilio 8k Mu-Law -> Gemini 16k PCM
-            const pcm16k = processAudioChunk(audioBuffer);
-            const base64Audio = Buffer.from(pcm16k.buffer).toString('base64');
-            
-            this.session.sendRealtimeInput([{
-                mimeType: "audio/pcm;rate=16000",
-                data: base64Audio
-            }]);
+            try {
+                const pcm16k = processAudioChunk(audioBuffer);
+                const base64Audio = Buffer.from(pcm16k.buffer).toString('base64');
+                this.session.sendRealtimeInput([{
+                    mimeType: "audio/pcm;rate=16000",
+                    data: base64Audio
+                }]);
+            } catch (e) {
+                // Ignore small audio frame errors
+            }
         }
     }
 
@@ -239,55 +248,34 @@ export class GeminiService {
         this.log('Session ended.');
     }
     
-    // --- CALENDAR LOGIC ---
+    // --- CALENDAR (Same as before) ---
     async getAvailableSlots({ date, barber }) {
         const calendarId = this.calendarIds[barber] || 'primary';
         const startOfDay = new Date(`${date}T09:00:00`);
         const endOfDay = new Date(`${date}T19:00:00`);
-
         try {
             const response = await this.googleCalendar.events.list({
-                calendarId,
-                timeMin: startOfDay.toISOString(),
-                timeMax: endOfDay.toISOString(),
-                singleEvents: true,
-                orderBy: 'startTime',
+                calendarId, timeMin: startOfDay.toISOString(), timeMax: endOfDay.toISOString(), singleEvents: true, orderBy: 'startTime',
             });
-            
-            // Return generic availability to encourage natural conversation
-            const busyTimes = response.data.items.map(e => {
-                const s = new Date(e.start.dateTime);
-                return `${s.getHours()}:${s.getMinutes().toString().padStart(2,'0')}`;
-            });
-            return { 
-                status: "success", 
-                message: `Checked calendar for ${barber} on ${date}.`,
-                busy_slots: busyTimes,
-                info: "The shop is open 09:00 to 19:00. Slots are 30 mins."
-            };
-            
-        } catch (error) {
-            return { error: 'Calendar access failed.' };
-        }
+            const busyTimes = response.data.items.map(e => e.start.dateTime.slice(11, 16));
+            return { status: "success", busy: busyTimes, message: "Shop open 09:00-19:00." };
+        } catch (error) { return { error: 'Calendar Error' }; }
     }
 
     async bookAppointment({ dateTime, barber, service, clientName }) {
         const calendarId = this.calendarIds[barber] || 'primary';
         const startTime = new Date(dateTime);
         const endTime = new Date(startTime.getTime() + 30 * 60000);
-
         const event = {
             summary: `${service} - ${clientName}`,
             start: { dateTime: startTime.toISOString(), timeZone: 'Europe/Sofia' },
             end: { dateTime: endTime.toISOString(), timeZone: 'Europe/Sofia' },
-            description: `Booked by AI Emma. Client: ${clientName}`,
+            description: `AI Booking. Client: ${clientName}`,
         };
         try {
             await this.googleCalendar.events.insert({ calendarId, resource: event });
-            this.onAppointmentsUpdate(); // Tells frontend to refresh
-            return { success: true, message: `Appointment confirmed for ${clientName} on ${dateTime}.` };
-        } catch (error) {
-            return { success: false, error: 'Booking failed.' };
-        }
+            this.onAppointmentsUpdate();
+            return { success: true, message: `Booked!` };
+        } catch (error) { return { success: false, error: 'Fail' }; }
     }
 }
