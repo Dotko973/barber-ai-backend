@@ -6,17 +6,12 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import { WebSocketServer } from "ws";
 import http from "http";
-// Import the GeminiService class
 import { GeminiService } from "./GeminiService.js"; 
 
-// Create Express app
 const app = express();
-// Create HTTP server (needed for WebSockets)
 const server = http.createServer(app);
 
-// ----------------------------------------------------
-// GLOBAL CORS CONFIG
-// ----------------------------------------------------
+// CORS CONFIG
 const allowedOrigins = [
   "http://localhost:5173",
   "https://excellent-range-296913.web.app",
@@ -38,15 +33,12 @@ app.use(cors({
 }));
 
 app.use(bodyParser.json());
-// Handle Twilio form data
 app.use(bodyParser.urlencoded({ extended: false }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===============================
 // GOOGLE CALENDAR AUTH
-// ===============================
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -59,17 +51,13 @@ oauth2Client.setCredentials({
 
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-// Define Calendar IDs (Replace with real IDs if you have multiple barbers)
 const calendarIds = {
   "Мохамед": "primary", 
-  "Джейсън": "primary" // potentially a second calendar ID
+  "Джейсън": "primary" 
 };
 
-// ===============================
-// SSE (Frontend Live Updates)
-// ===============================
+// SSE BROADCAST
 let sseClients = [];
-
 function broadcastToFrontend(type, data) {
   sseClients.forEach(client => {
     if (!client.res.writableEnded) {
@@ -85,55 +73,39 @@ app.get("/api/events", (req, res) => {
   if (res.flushHeaders) res.flushHeaders();
 
   const clientId = Date.now();
-  const newClient = { id: clientId, res };
-  sseClients.push(newClient);
+  sseClients.push({ id: clientId, res });
 
-  console.log(`Frontend connected: ${clientId}`);
-  
-  // Initial message
   res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Backend Realtime Stream" } })}\n\n`);
 
   req.on("close", () => {
-    console.log(`Frontend disconnected: ${clientId}`);
     sseClients = sseClients.filter(c => c.id !== clientId);
   });
 });
 
-// ===============================
-// TWILIO INCOMING CALL (Route)
-// ===============================
+// TWILIO INCOMING CALL
 app.post("/incoming-call", (req, res) => {
-  console.log("Incoming call received!");
-  
-  // Respond with TwiML to connect the call to our WebSocket stream
   const host = req.headers.host; 
   const twiml = `
     <Response>
-      <Say language="bg-BG">Здравейте, свързвам ви с Ема, вашият AI асистент.</Say>
+      <Say language="bg-BG">Здравейте, свързвам ви с Ема.</Say>
       <Connect>
         <Stream url="wss://${host}/connection" />
       </Connect>
     </Response>
   `;
-
-  res.type("text/xml");
-  res.send(twiml);
+  res.type("text/xml").send(twiml);
 });
 
-// ===============================
-// WEBSOCKET SERVER (Twilio Audio Stream)
-// ===============================
+// WEBSOCKET SERVER
 const wss = new WebSocketServer({ server, path: "/connection" });
 
 wss.on("connection", (ws) => {
   console.log("Twilio Media Stream Connected");
-
-  // defined callbacks to send data to Frontend via SSE
+  
   const onTranscript = (data) => broadcastToFrontend("transcript", data);
   const onLog = (data) => broadcastToFrontend("log", data);
   const onAppointmentsUpdate = () => broadcastToFrontend("appointment_update", { message: "New appointment booked!" });
 
-  // Initialize Gemini Service
   const gemini = new GeminiService(
     onTranscript,
     onLog,
@@ -142,52 +114,63 @@ wss.on("connection", (ws) => {
     calendarIds
   );
 
-  gemini.startSession(ws);
+  // Don't start Gemini yet. Wait for Twilio "start" event to get the Stream SID.
 
   ws.on("message", (message) => {
     try {
       const data = JSON.parse(message);
       
-      if (data.event === "media") {
-        // Twilio sends base64 audio in data.media.payload
+      if (data.event === "start") {
+        console.log("Twilio Stream Started. SID:", data.start.streamSid);
+        // Pass the stream SID to Gemini so it knows where to send audio back
+        gemini.setStreamSid(data.start.streamSid);
+        gemini.startSession(ws);
+      }
+      else if (data.event === "media") {
         const audioBuffer = Buffer.from(data.media.payload, "base64");
         gemini.handleAudio(audioBuffer);
       } 
-      else if (data.event === "start") {
-        console.log("Twilio Stream Started:", data.streamSid);
-      }
       else if (data.event === "stop") {
         console.log("Twilio Stream Stopped");
         gemini.endSession();
       }
     } catch (error) {
-      console.error("Error processing WebSocket message:", error);
+      console.error("WS Error:", error);
     }
   });
 
   ws.on("close", () => {
-    console.log("Twilio Media Stream Disconnected");
+    console.log("Twilio Disconnected");
     gemini.endSession();
   });
 });
 
-// ===============================
-// STANDARD API ROUTES
-// ===============================
-app.get("/", (req, res) => res.send("Barbershop AI Backend"));
-app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
-
-app.get("/api/test-calendar", async (req, res) => {
-  if (calendar) res.json({ success: true, message: "Calendar service ready." });
-  else res.status(500).json({ success: false, error: "Calendar not init." });
+// APPOINTMENTS API
+app.get("/api/appointments", async (req, res) => {
+  try {
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: new Date().toISOString(),
+      maxResults: 10,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+    const appointments = response.data.items.map(event => {
+      const start = new Date(event.start.dateTime || event.start.date);
+      return {
+        id: event.id,
+        customerName: event.summary || "Busy",
+        date: start.toLocaleDateString(),
+        time: start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+    });
+    res.json(appointments);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch appointments" });
+  }
 });
 
-// ===============================
-// START SERVER
-// ===============================
 const PORT = process.env.PORT || 3000;
-
-// IMPORTANT: Listen with 'server', not 'app', to support WebSockets
 server.listen(PORT, () => {
   console.log(`✅ Barbershop backend running on port ${PORT}`);
 });
