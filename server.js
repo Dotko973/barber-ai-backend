@@ -11,7 +11,9 @@ import { GeminiService } from "./GeminiService.js";
 const app = express();
 const server = http.createServer(app);
 
-// CORS CONFIG
+// ----------------------------------------------------
+// CORS & MIDDLEWARE
+// ----------------------------------------------------
 const allowedOrigins = [
   "http://localhost:5173",
   "https://excellent-range-296913.web.app",
@@ -38,7 +40,9 @@ app.use(bodyParser.urlencoded({ extended: false }));
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// GOOGLE CALENDAR AUTH
+// ----------------------------------------------------
+// GOOGLE CALENDAR SETUP
+// ----------------------------------------------------
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -56,8 +60,11 @@ const calendarIds = {
   "Джейсън": "primary" 
 };
 
-// SSE BROADCAST
+// ----------------------------------------------------
+// SSE (REALTIME FRONTEND UPDATES)
+// ----------------------------------------------------
 let sseClients = [];
+
 function broadcastToFrontend(type, data) {
   sseClients.forEach(client => {
     if (!client.res.writableEnded) {
@@ -75,6 +82,7 @@ app.get("/api/events", (req, res) => {
   const clientId = Date.now();
   sseClients.push({ id: clientId, res });
 
+  // Initial Log
   res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Backend Realtime Stream" } })}\n\n`);
 
   req.on("close", () => {
@@ -82,7 +90,54 @@ app.get("/api/events", (req, res) => {
   });
 });
 
-// TWILIO INCOMING CALL
+// ----------------------------------------------------
+// API ROUTES (Restored)
+// ----------------------------------------------------
+
+// 1. Root Check
+app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
+
+// 2. Test Calendar Connection (FIXED: Restored this route)
+app.get("/api/test-calendar", async (req, res) => {
+  try {
+    const response = await calendar.calendarList.list();
+    res.json({ success: true, message: "Calendar service is ready.", data: response.data });
+  } catch (error) {
+    console.error("Calendar Test Failed:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 3. Get Appointments
+app.get("/api/appointments", async (req, res) => {
+  try {
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: new Date().toISOString(),
+      maxResults: 10,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    const appointments = response.data.items.map(event => {
+      const start = new Date(event.start.dateTime || event.start.date);
+      return {
+        id: event.id,
+        customerName: event.summary || "Busy",
+        date: start.toLocaleDateString(),
+        time: start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+    });
+    res.json(appointments);
+  } catch (error) {
+    console.error("Fetch Appointments Error:", error);
+    res.status(500).json({ error: "Failed to fetch appointments" });
+  }
+});
+
+// ----------------------------------------------------
+// TWILIO VOICE HANDLERS
+// ----------------------------------------------------
 app.post("/incoming-call", (req, res) => {
   const host = req.headers.host; 
   const twiml = `
@@ -96,12 +151,14 @@ app.post("/incoming-call", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// WEBSOCKET SERVER
+// ----------------------------------------------------
+// WEBSOCKET SERVER (Audio Stream)
+// ----------------------------------------------------
 const wss = new WebSocketServer({ server, path: "/connection" });
 
 wss.on("connection", (ws) => {
   console.log("Twilio Media Stream Connected");
-  
+
   const onTranscript = (data) => broadcastToFrontend("transcript", data);
   const onLog = (data) => broadcastToFrontend("log", data);
   const onAppointmentsUpdate = () => broadcastToFrontend("appointment_update", { message: "New appointment booked!" });
@@ -114,15 +171,12 @@ wss.on("connection", (ws) => {
     calendarIds
   );
 
-  // Don't start Gemini yet. Wait for Twilio "start" event to get the Stream SID.
-
   ws.on("message", (message) => {
     try {
       const data = JSON.parse(message);
       
       if (data.event === "start") {
         console.log("Twilio Stream Started. SID:", data.start.streamSid);
-        // Pass the stream SID to Gemini so it knows where to send audio back
         gemini.setStreamSid(data.start.streamSid);
         gemini.startSession(ws);
       }
@@ -143,31 +197,6 @@ wss.on("connection", (ws) => {
     console.log("Twilio Disconnected");
     gemini.endSession();
   });
-});
-
-// APPOINTMENTS API
-app.get("/api/appointments", async (req, res) => {
-  try {
-    const response = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: new Date().toISOString(),
-      maxResults: 10,
-      singleEvents: true,
-      orderBy: 'startTime',
-    });
-    const appointments = response.data.items.map(event => {
-      const start = new Date(event.start.dateTime || event.start.date);
-      return {
-        id: event.id,
-        customerName: event.summary || "Busy",
-        date: start.toLocaleDateString(),
-        time: start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
-    });
-    res.json(appointments);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch appointments" });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
