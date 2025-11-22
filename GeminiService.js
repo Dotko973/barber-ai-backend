@@ -1,4 +1,4 @@
-// GeminiService.js - Final Audio Speed Fix
+// GeminiService.js - Standard G.711 Implementation
 
 import { GoogleGenAI } from '@google/genai';
 import { google } from 'googleapis';
@@ -6,86 +6,106 @@ import { google } from 'googleapis';
 const API_KEY = process.env.API_KEY;
 const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 
-// --- AUDIO CONVERSION UTILITIES ---
+// =================================================================
+// STANDARD G.711 MU-LAW LOOKUP TABLES (Battle-Tested)
+// =================================================================
+const muLawToPcmTable = [
+  -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
+  -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
+  -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
+  -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
+  -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
+  -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
+  -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
+  -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
+  -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
+  -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
+  -876, -844, -812, -780, -748, -716, -684, -652,
+  -620, -588, -556, -524, -492, -460, -428, -396,
+  -372, -356, -340, -324, -308, -292, -276, -260,
+  -244, -228, -212, -196, -180, -164, -148, -132,
+  -120, -112, -104, -96, -88, -80, -72, -64,
+  -56, -48, -40, -32, -24, -16, -8, 0,
+  32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
+  23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
+  15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
+  11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
+  7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
+  5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
+  3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
+  2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
+  1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
+  1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
+  876, 844, 812, 780, 748, 716, 684, 652,
+  620, 588, 556, 524, 492, 460, 428, 396,
+  372, 356, 340, 324, 308, 292, 276, 260,
+  244, 228, 212, 196, 180, 164, 148, 132,
+  120, 112, 104, 96, 88, 80, 72, 64,
+  56, 48, 40, 32, 24, 16, 8, 0
+];
 
-// Mu-Law (8-bit) table for decoding
-const muLawToPcmMap = new Int16Array(256);
-for (let i = 0; i < 256; i++) {
-    let byte = ~i;
-    let sign = byte & 0x80 ? -1 : 1;
-    let exponent = (byte >> 4) & 0x07;
-    let mantissa = byte & 0x0f;
-    let sample = sign * ((((mantissa << 3) + 0x84) << exponent) - 0x84);
-    muLawToPcmMap[i] = sample;
-}
-
-// PCM (16-bit) -> Mu-Law (8-bit) Encoder
-function encodeMuLaw(sample) {
-    const BIAS = 0x84;
-    const CLIP = 32635;
-    sample = sample < -CLIP ? -CLIP : sample > CLIP ? CLIP : sample;
-    const sign = sample < 0 ? 0x80 : 0;
-    sample = sample < 0 ? -sample : sample;
-    sample += BIAS;
-    let exponent = 0;
-    if (sample > 0x7F00) exponent = 7;
-    else {
-        let temp = sample >> 8;
-        if (temp > 0) { exponent = 4; temp >>= 4; }
-        if (temp > 0) { exponent += 2; temp >>= 2; }
-        if (temp > 0) { exponent += 1; }
+const pcmToMuLawMap = new Int8Array(65536);
+// Generate encode map once
+for (let i = -32768; i <= 32767; i++) {
+    let sample = i;
+    const sign = (sample >> 8) & 0x80;
+    if (sample < 0) sample = -sample;
+    sample += 132;
+    if (sample > 32767) sample = 32767;
+    
+    let exponent = 7;
+    for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; mask >>= 1) {
+        exponent--;
     }
     const mantissa = (sample >> (exponent + 3)) & 0x0F;
-    return ~(sign | (exponent << 4) | mantissa);
+    const mulaw = ~(sign | (exponent << 4) | mantissa);
+    pcmToMuLawMap[i + 32768] = mulaw;
 }
 
-// 1. INCOMING: Twilio (8k Mu-Law) -> Gemini (16k PCM)
+// =================================================================
+// AUDIO PROCESSING FUNCTIONS
+// =================================================================
+
+// INCOMING: Twilio (8k MuLaw) -> Gemini (16k PCM)
 function processTwilioAudio(buffer) {
-    if (!buffer || buffer.length === 0) return Buffer.alloc(0);
-
-    // Decode 8k Mu-Law to 8k PCM
-    const pcm8k = new Int16Array(buffer.length);
-    for (let i = 0; i < buffer.length; i++) {
-        pcm8k[i] = muLawToPcmMap[buffer[i]];
-    }
-
-    // Upsample 8k -> 16k (Duplicate every sample)
-    const pcm16k = new Int16Array(pcm8k.length * 2);
-    for (let i = 0; i < pcm8k.length; i++) {
-        const val = pcm8k[i];
-        pcm16k[i * 2] = val;
-        pcm16k[i * 2 + 1] = val;
-    }
+    const len = buffer.length;
+    const pcm16k = new Int16Array(len * 2); // Upsample x2
     
+    for (let i = 0; i < len; i++) {
+        // 1. Decode MuLaw -> 8k PCM
+        const pcmSample = muLawToPcmTable[buffer[i]];
+        
+        // 2. Upsample 8k -> 16k (Duplicate sample)
+        pcm16k[i * 2] = pcmSample;
+        pcm16k[i * 2 + 1] = pcmSample;
+    }
     return Buffer.from(pcm16k.buffer);
 }
 
-// 2. OUTGOING: Gemini (24k PCM) -> Twilio (8k Mu-Law)
-function processGeminiAudio(chunk) {
-    if (!chunk || chunk.length === 0) return Buffer.alloc(0);
-
-    // Create a DataView to read the Little Endian PCM data safely
-    const srcBuffer = Buffer.from(chunk, 'base64');
-    const srcLen = srcBuffer.length / 2; // Number of 16-bit samples
+// OUTGOING: Gemini (24k PCM) -> Twilio (8k MuLaw)
+function processGeminiAudio(chunkBase64) {
+    const srcBuffer = Buffer.from(chunkBase64, 'base64');
+    // srcBuffer is PCM16 Little Endian at 24kHz
+    const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
     
-    // We want to downsample 24k -> 8k. That is a ratio of 3.
-    // We take every 3rd sample.
-    const outputLen = Math.floor(srcLen / 3);
-    const outputBuffer = Buffer.alloc(outputLen); // 1 byte per sample (Mu-Law)
-
-    for (let i = 0; i < outputLen; i++) {
-        // Read 16-bit sample at index * 3
-        // i*3*2 because each sample is 2 bytes
-        const offset = i * 3 * 2; 
-        if (offset + 1 < srcBuffer.length) {
-            const pcmSample = srcBuffer.readInt16LE(offset);
-            outputBuffer[i] = encodeMuLaw(pcmSample);
-        }
+    // Downsample 24k -> 8k (Ratio 3:1)
+    const outLen = Math.floor(srcSamples.length / 3);
+    const outBuffer = Buffer.alloc(outLen);
+    
+    for (let i = 0; i < outLen; i++) {
+        // Take every 3rd sample
+        const val = srcSamples[i * 3];
+        
+        // Encode to MuLaw
+        // Map index is val + 32768 (to handle negative indices)
+        outBuffer[i] = pcmToMuLawMap[val + 32768];
     }
-
-    return outputBuffer;
+    return outBuffer;
 }
 
+// =================================================================
+// SERVICE CLASS
+// =================================================================
 
 export class GeminiService {
     constructor(onTranscript, onLog, onAppointmentsUpdate, oAuth2Client, calendarIds) {
@@ -108,12 +128,12 @@ export class GeminiService {
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Initializing Emma (Bulgarian - Fixed Audio)...');
+        this.log('Connecting to Gemini (Bulgarian)...');
 
         const functionDeclarations = [
             {
                 name: 'getAvailableSlots',
-                description: 'Checks available slots.',
+                description: 'Get available appointment slots.',
                 parameters: {
                     type: "OBJECT",
                     properties: {
@@ -125,7 +145,7 @@ export class GeminiService {
             },
             {
                 name: 'bookAppointment',
-                description: 'Books appointment.',
+                description: 'Book an appointment.',
                 parameters: {
                     type: "OBJECT",
                     properties: {
@@ -151,23 +171,23 @@ export class GeminiService {
                     systemInstruction: { parts: [{ text: `
                         Ти си Ема, AI рецепционист.
                         1. Говори САМО на Български.
-                        2. Представи се кратко: "Здравейте, аз съм Ема".
-                        3. Попитай как да помогнеш за запазване на час.
-                        4. Днес е ${new Date().toLocaleDateString('bg-BG')}.
+                        2. Поздрави: "Здравейте, тук е Ема. Как мога да помогна?".
+                        3. Днес е ${new Date().toLocaleDateString('bg-BG')}.
                     ` }] }
                 },
             });
             
             this.session = await this.sessionPromise;
-            this.log('Connected to Gemini.');
+            this.log('Session Connected.');
 
+            // Receive Loop
             (async () => {
                 try {
                     for await (const msg of this.session.receive()) {
                         this.handleLiveMessage(msg);
                     }
                 } catch (err) {
-                    this.log('Receive Loop Error:', err);
+                    this.log('Stream Error:', err);
                 }
             })();
 
@@ -198,21 +218,21 @@ export class GeminiService {
 
     handleLiveMessage(message) {
         try {
-            // 1. Text
+            // 1. Text Transcript
             if (message.serverContent?.modelTurn?.parts) {
                 for (const part of message.serverContent.modelTurn.parts) {
                     if (part.text) {
                         this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
                     }
-                    // 2. Audio (CRITICAL FIX HERE)
+                    // 2. Audio Response
                     if (part.inlineData && part.inlineData.data) {
-                        // Process the base64 PCM data directly using our new function
-                        const mulawBuffer = processGeminiAudio(part.inlineData.data);
+                        // Downsample and Encode
+                        const mulawPayload = processGeminiAudio(part.inlineData.data);
                         
                         if(this.ws && this.ws.readyState === this.ws.OPEN) {
                             this.ws.send(JSON.stringify({
                                 event: 'media',
-                                media: { payload: mulawBuffer.toString('base64') }
+                                media: { payload: mulawPayload.toString('base64') }
                             }));
                         }
                     }
@@ -221,22 +241,22 @@ export class GeminiService {
             // 3. Tools
             if (message.toolCall) this.handleFunctionCall(message.toolCall);
         } catch (error) {
-            this.log("Message Processing Error", error);
+            // Suppress audio frame errors to prevent crash
         }
     }
 
     handleAudio(audioBuffer) {
         if (this.session) {
             try {
+                // Decode and Upsample
                 const pcm16kBuffer = processTwilioAudio(audioBuffer);
-                const base64Audio = pcm16kBuffer.toString('base64');
                 
                 this.session.sendRealtimeInput([{
                     mimeType: "audio/pcm;rate=16000",
-                    data: base64Audio
+                    data: pcm16kBuffer.toString('base64')
                 }]);
             } catch (e) {
-                // Ignore empty frames
+                // Ignore
             }
         }
     }
@@ -247,7 +267,7 @@ export class GeminiService {
         this.log('Session ended.');
     }
     
-    // --- CALENDAR ---
+    // --- CALENDAR LOGIC (Unchanged) ---
     async getAvailableSlots({ date, barber }) {
         const calendarId = this.calendarIds[barber] || 'primary';
         const startOfDay = new Date(`${date}T09:00:00`);
