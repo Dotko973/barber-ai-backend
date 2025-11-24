@@ -5,12 +5,16 @@ const API_KEY = process.env.API_KEY;
 const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
-// --- AUDIO MATH (Standard G.711) ---
+// =================================================================
+// AUDIO MATH (G.711 & Resampling)
+// =================================================================
+
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
     let u=~i&0xff, s=(u&0x80)?-1:1, e=(u>>4)&0x07, m=u&0x0f;
     let v=((m<<1)+1)<<(e+2); v-=132; muLawToPcmTable[i]=s*v;
 }
+
 const pcmToMuLawMap = new Int8Array(65536);
 for (let i=-32768; i<=32767; i++) {
     let s=i, si=(s>>8)&0x80; if(s<0)s=-s; s+=132; if(s>32767)s=32767;
@@ -39,7 +43,10 @@ function processGeminiAudio(chunkBase64) {
     return outBuffer;
 }
 
-// --- SERVICE ---
+// =================================================================
+// GEMINI SERVICE (Raw WebSocket)
+// =================================================================
+
 export class GeminiService {
     constructor(onTranscript, onLog, onAppointmentsUpdate, oAuth2Client, calendarIds) {
         this.ws = null;
@@ -62,7 +69,7 @@ export class GeminiService {
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Starting Raw Socket...');
+        this.log('Connecting Raw Socket...');
 
         try {
             this.geminiWs = new WebSocket(GEMINI_URL);
@@ -70,24 +77,52 @@ export class GeminiService {
             this.geminiWs.on('open', () => {
                 this.log('Gemini Socket OPEN.');
                 
-                // 1. SETUP (Added TEXT modality)
+                // 1. SETUP MESSAGE (Fixed: AUDIO Only)
                 const setupMessage = {
                     setup: {
                         model: MODEL_NAME,
                         generationConfig: {
-                            responseModalities: ["AUDIO", "TEXT"], // <--- FIX: Request Text back!
+                            responseModalities: ["AUDIO"], // FIX: Removing "TEXT" fixes Error 1007
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
-                        }
+                        },
+                        systemInstruction: {
+                            parts: [{ text: `Ти си Ема, професионален AI рецепционист в бръснарница "Gentleman's Choice". Говори САМО на Български език. Бъди кратка, учтива и помагай на клиентите да запазят час. Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.` }]
+                        },
+                        tools: [
+                            // Re-adding Calendar Tools
+                            {
+                                functionDeclarations: [
+                                    {
+                                        name: "getAvailableSlots",
+                                        description: "Checks available slots",
+                                        parameters: {
+                                            type: "OBJECT",
+                                            properties: { date: { type: "STRING" }, barber: { type: "STRING" } },
+                                            required: ["date", "barber"]
+                                        }
+                                    },
+                                    {
+                                        name: "bookAppointment",
+                                        description: "Books appointment",
+                                        parameters: {
+                                            type: "OBJECT",
+                                            properties: { dateTime: { type: "STRING" }, barber: { type: "STRING" }, service: { type: "STRING" }, clientName: { type: "STRING" } },
+                                            required: ["dateTime", "barber", "service", "clientName"]
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setupMessage));
                 
-                // 2. TRIGGER GREETING
+                // 2. INITIAL GREETING TRIGGER
                 const triggerMessage = {
                     clientContent: {
                         turns: [{
                             role: "user",
-                            parts: [{ text: "Здравей, Ема. Представи се." }]
+                            parts: [{ text: "Здравей! Представи се." }]
                         }],
                         turnComplete: true
                     }
@@ -99,12 +134,12 @@ export class GeminiService {
                 this.handleGeminiMessage(data);
             });
 
-            this.geminiWs.on('close', (code, reason) => {
-                this.log(`SOCKET CLOSED. Code: ${code}, Reason: ${reason}`);
-            });
-
             this.geminiWs.on('error', (err) => {
                 this.log('SOCKET ERROR', err.message);
+            });
+
+            this.geminiWs.on('close', (code, reason) => {
+                this.log(`SOCKET CLOSED. Code: ${code}, Reason: ${reason}`);
             });
 
         } catch (error) {
@@ -117,20 +152,14 @@ export class GeminiService {
             const msgStr = data.toString();
             const msg = JSON.parse(msgStr);
 
-            // DEBUG: Log the first text we see to prove it's working
-            if (msg.serverContent?.modelTurn?.parts?.[0]?.text) {
-                console.log("GEMINI SAYS:", msg.serverContent.modelTurn.parts[0].text);
-            }
-
+            // Handle Audio
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
-                    // Handle Text
-                    if (part.text) {
-                        this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
-                    }
-                    // Handle Audio
+                    // We log this to prove we are receiving data
                     if (part.inlineData?.data) {
+                        // console.log("[GEMINI] Received Audio Chunk"); 
                         const mulawAudio = processGeminiAudio(part.inlineData.data);
+                        
                         if (this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
                             this.ws.send(JSON.stringify({
                                 event: 'media',
@@ -141,8 +170,36 @@ export class GeminiService {
                     }
                 }
             }
+            
+            // Handle Tool Calls
+            if (msg.toolCall) {
+                this.handleFunctionCall(msg.toolCall);
+            }
+
         } catch (e) { 
-            console.error("Parse Error", e);
+            // console.error("Parse Error", e);
+        }
+    }
+
+    async handleFunctionCall(toolCall) {
+        // Basic Tool Handling Logic
+        for (const fc of toolCall.functionCalls) {
+            this.log(`Tool Call: ${fc.name}`);
+            let result = { result: "Success" };
+            
+            if (fc.name === 'getAvailableSlots') result = await this.getAvailableSlots(fc.args);
+            else if (fc.name === 'bookAppointment') result = await this.bookAppointment(fc.args);
+
+            const response = {
+                toolResponse: {
+                    functionResponses: [{
+                        id: fc.id,
+                        name: fc.name,
+                        response: { result: { object_value: result } }
+                    }]
+                }
+            };
+            this.geminiWs.send(JSON.stringify(response));
         }
     }
 
@@ -170,6 +227,7 @@ export class GeminiService {
         this.log('Session Ended');
     }
     
-    async getAvailableSlots() { return {status: "open"}; }
-    async bookAppointment() { this.onAppointmentsUpdate(); return {status: "booked"}; }
+    // Calendar Stubs (To prevent crashes if tools are called)
+    async getAvailableSlots() { return { status: "success", message: "Hours: 09:00 - 19:00" }; }
+    async bookAppointment() { this.onAppointmentsUpdate(); return { status: "success", message: "Booked!" }; }
 }
