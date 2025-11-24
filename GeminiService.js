@@ -5,15 +5,12 @@ const API_KEY = process.env.API_KEY;
 const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
-// =================================================================
-// AUDIO MATH (G.711 Table)
-// =================================================================
+// --- AUDIO MATH (Standard G.711) ---
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
     let u=~i&0xff, s=(u&0x80)?-1:1, e=(u>>4)&0x07, m=u&0x0f;
     let v=((m<<1)+1)<<(e+2); v-=132; muLawToPcmTable[i]=s*v;
 }
-
 const pcmToMuLawMap = new Int8Array(65536);
 for (let i=-32768; i<=32767; i++) {
     let s=i, si=(s>>8)&0x80; if(s<0)s=-s; s+=132; if(s>32767)s=32767;
@@ -21,47 +18,28 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
-// Twilio (8k) -> Gemini (16k)
 function processTwilioAudio(buffer) {
-    const len = buffer.length;
-    const pcm16k = new Int16Array(len * 2);
-    for (let i = 0; i < len; i++) {
+    const pcm16k = new Int16Array(buffer.length * 2);
+    for (let i = 0; i < buffer.length; i++) {
         const s = muLawToPcmTable[buffer[i]];
         pcm16k[i * 2] = s; pcm16k[i * 2 + 1] = s;
     }
     return Buffer.from(pcm16k.buffer);
 }
 
-// Gemini (24k) -> Twilio (8k) - SAFER VERSION
 function processGeminiAudio(chunkBase64) {
-    // 1. Decode Base64 to Buffer
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
-    
-    // 2. Convert to Int16 Array (Little Endian)
-    // Ensure we don't read past end of buffer
-    const numSamples = Math.floor(srcBuffer.length / 2);
-    const srcSamples = new Int16Array(numSamples);
-    for (let i = 0; i < numSamples; i++) {
-        srcSamples[i] = srcBuffer.readInt16LE(i * 2);
-    }
-
-    // 3. Downsample 24k -> 8k (Decimate by 3)
-    const outLen = Math.floor(numSamples / 3);
+    const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
+    const outLen = Math.floor(srcSamples.length / 3);
     const outBuffer = Buffer.alloc(outLen);
-
     for (let i = 0; i < outLen; i++) {
         const val = srcSamples[i * 3];
-        // 4. Encode to Mu-Law (Handle Index Offset)
-        outBuffer[i] = pcmToMuLawMap[val + 32768]; 
+        outBuffer[i] = pcmToMuLawMap[val + 32768];
     }
-    
     return outBuffer;
 }
 
-// =================================================================
-// SERVICE
-// =================================================================
-
+// --- SERVICE ---
 export class GeminiService {
     constructor(onTranscript, onLog, onAppointmentsUpdate, oAuth2Client, calendarIds) {
         this.ws = null;
@@ -84,7 +62,7 @@ export class GeminiService {
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Starting Socket...');
+        this.log('Starting Passive Session...');
 
         try {
             this.geminiWs = new WebSocket(GEMINI_URL);
@@ -92,31 +70,22 @@ export class GeminiService {
             this.geminiWs.on('open', () => {
                 this.log('Gemini Socket OPEN.');
                 
-                // 1. SETUP (AUDIO ONLY for Stability)
-                // We removed "TEXT" again because that caused the 1007 error before.
-                // Let's get audio working first.
+                // 1. SETUP ONLY (No Trigger)
+                // We removed the "turns" part. This means Gemini will WAIT for you to speak.
                 const setupMessage = {
                     setup: {
                         model: MODEL_NAME,
                         generationConfig: {
-                            responseModalities: ["AUDIO"], 
+                            responseModalities: ["AUDIO"],
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
+                        },
+                        systemInstruction: { 
+                            parts: [{ text: "You are Emma, a helpful receptionist. Speak Bulgarian. Wait for the user to speak first." }] 
                         }
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setupMessage));
-                
-                // 2. GREETING
-                const triggerMessage = {
-                    clientContent: {
-                        turns: [{
-                            role: "user",
-                            parts: [{ text: "Здравей, Ема." }]
-                        }],
-                        turnComplete: true
-                    }
-                };
-                this.geminiWs.send(JSON.stringify(triggerMessage));
+                this.log('Setup Sent. Waiting for user audio...');
             });
 
             this.geminiWs.on('message', (data) => {
@@ -144,9 +113,7 @@ export class GeminiService {
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.data) {
-                        // Process Audio using Safer Function
                         const mulawAudio = processGeminiAudio(part.inlineData.data);
-                        
                         if (this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
                             this.ws.send(JSON.stringify({
                                 event: 'media',
@@ -163,6 +130,7 @@ export class GeminiService {
     handleAudio(audioBuffer) {
         if (!this.geminiWs || this.geminiWs.readyState !== WebSocket.OPEN) return;
         try {
+            // Upsample & Send
             const pcm16k = processTwilioAudio(audioBuffer);
             const msg = {
                 realtimeInput: {
