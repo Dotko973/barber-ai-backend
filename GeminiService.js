@@ -1,11 +1,12 @@
-import { GoogleGenAI } from '@google/genai';
+import WebSocket from 'ws';
 import { google } from 'googleapis';
 
 const API_KEY = process.env.API_KEY;
 const MODEL_NAME = 'models/gemini-2.0-flash-exp';
+const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO TABLES & UTILS (Proven to work)
+// AUDIO MATH (G.711 & Resampling)
 // =================================================================
 
 const muLawToPcmTable = new Int16Array(256);
@@ -21,6 +22,7 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
+// Upsample 8k -> 16k
 function processTwilioAudio(buffer) {
     const pcm16k = new Int16Array(buffer.length * 2);
     for (let i = 0; i < buffer.length; i++) {
@@ -30,30 +32,28 @@ function processTwilioAudio(buffer) {
     return Buffer.from(pcm16k.buffer);
 }
 
+// Downsample 24k -> 8k
 function processGeminiAudio(chunkBase64) {
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
-    const outLen = Math.floor((srcBuffer.length / 2) / 3);
+    const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
+    const outLen = Math.floor(srcSamples.length / 3);
     const outBuffer = Buffer.alloc(outLen);
-
     for (let i = 0; i < outLen; i++) {
-        const offset = i * 6; 
-        if (offset + 1 < srcBuffer.length) {
-            const sample = srcBuffer.readInt16LE(offset);
-            outBuffer[i] = pcmToMuLawMap[sample + 32768];
-        }
+        // Read every 3rd sample to convert 24k to 8k
+        const val = srcSamples[i * 3];
+        outBuffer[i] = pcmToMuLawMap[val + 32768];
     }
     return outBuffer;
 }
 
 // =================================================================
-// GEMINI SERVICE
+// GEMINI SERVICE (Raw WebSocket)
 // =================================================================
 
 export class GeminiService {
     constructor(onTranscript, onLog, onAppointmentsUpdate, oAuth2Client, calendarIds) {
-        this.ai = new GoogleGenAI({ apiKey: API_KEY });
-        this.session = null;
-        this.ws = null;
+        this.ws = null;         // Twilio Socket
+        this.geminiWs = null;   // Google Socket
         this.streamSid = null;
         this.onTranscript = onTranscript;
         this.onLog = onLog;
@@ -70,83 +70,125 @@ export class GeminiService {
         if (data instanceof Error) str = data.message + (data.stack ? "\n" + data.stack : "");
         else if (typeof data === 'object') try { str = JSON.stringify(data); } catch { str = "Obj"; }
         else str = String(data);
-        
-        const fullLog = `[GEMINI] ${msg} ${str}`;
-        console.log(fullLog);
+        console.log(`[GEMINI] ${msg} ${str}`); // Azure Log
         this.onLog({ id: Date.now(), timestamp: new Date().toLocaleTimeString(), message: msg, data: str });
     }
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Starting Session Init...');
+        this.log('Connecting DIRECTLY to Gemini API...');
 
         try {
-            this.session = await this.ai.live.connect({
-                model: MODEL_NAME,
-                config: {
-                    responseModalities: ["AUDIO"], 
-                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } },
-                    systemInstruction: { parts: [{ text: "You are Emma. Speak Bulgarian. Help book appointments." }] }
-                },
-            });
-            
-            this.log('Session Object Created. Connected!');
+            // 1. Connect to Google via Raw WebSocket
+            this.geminiWs = new WebSocket(GEMINI_URL);
 
-            // --- REMOVED CRASHING BLOCK ---
-            // We deleted the "await this.session.send(...)" block here.
-            // The session is now open and waiting for audio.
-
-            // Receive Loop
-            (async () => {
-                this.log('Starting Receive Loop...');
-                try {
-                    for await (const msg of this.session.receive()) {
-                        this.handleLiveMessage(msg);
+            this.geminiWs.on('open', () => {
+                this.log('Gemini Socket OPEN.');
+                
+                // 2. Send Setup Message (JSON)
+                const setupMessage = {
+                    setup: {
+                        model: MODEL_NAME,
+                        generationConfig: {
+                            responseModalities: ["AUDIO"],
+                            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
+                        },
+                        systemInstruction: { parts: [{ text: "You are Emma. Speak Bulgarian. Be concise." }] }
                     }
-                } catch (err) {
-                    this.log('CRITICAL STREAM ERROR', err);
-                }
-            })();
+                };
+                this.geminiWs.send(JSON.stringify(setupMessage));
+                
+                // 3. Send Initial "Hello" Trigger
+                const triggerMessage = {
+                    clientContent: {
+                        turns: [{
+                            role: "user",
+                            parts: [{ text: "Hello" }]
+                        }],
+                        turnComplete: true
+                    }
+                };
+                this.geminiWs.send(JSON.stringify(triggerMessage));
+            });
+
+            this.geminiWs.on('message', (data) => {
+                this.handleGeminiMessage(data);
+            });
+
+            this.geminiWs.on('error', (err) => {
+                this.log('Gemini Socket Error:', err);
+            });
+
+            this.geminiWs.on('close', () => {
+                this.log('Gemini Socket Closed.');
+            });
 
         } catch (error) {
-            this.log('FATAL CONNECTION ERROR', error);
-            if(this.ws) this.ws.close();
+            this.log('Failed to init socket:', error);
         }
     }
 
-    handleLiveMessage(msg) {
+    handleGeminiMessage(data) {
         try {
-            const content = msg.serverContent;
-            if (content?.modelTurn?.parts) {
-                for (const part of content.modelTurn.parts) {
-                    if (part.text) this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
-                    
-                    if (part.inlineData?.data) {
-                        const audio = processGeminiAudio(part.inlineData.data);
-                        if(this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
-                            this.ws.send(JSON.stringify({ 
-                                event: 'media', 
-                                streamSid: this.streamSid, 
-                                media: { payload: audio.toString('base64') } 
+            // Raw buffer -> String -> JSON
+            const msgStr = data.toString();
+            const msg = JSON.parse(msgStr);
+
+            // Check for Audio
+            const parts = msg.serverContent?.modelTurn?.parts;
+            if (parts) {
+                for (const part of parts) {
+                    // Text
+                    if (part.text) {
+                        this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
+                    }
+                    // Audio
+                    if (part.inlineData && part.inlineData.data) {
+                        // Downsample 24k -> 8k
+                        const mulawAudio = processGeminiAudio(part.inlineData.data);
+                        
+                        if (this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
+                            this.ws.send(JSON.stringify({
+                                event: 'media',
+                                streamSid: this.streamSid,
+                                media: { payload: mulawAudio.toString('base64') }
                             }));
                         }
                     }
                 }
             }
-        } catch (e) { this.log("Msg Processing Error", e); }
+        } catch (e) {
+            // this.log('Parse Error', e);
+        }
     }
 
     handleAudio(audioBuffer) {
-        if (!this.session) return;
+        // Incoming Twilio Audio (8k)
+        if (!this.geminiWs || this.geminiWs.readyState !== WebSocket.OPEN) return;
+
         try {
-            const pcm16 = processTwilioAudio(audioBuffer);
-            // Use correct SDK method for streaming audio chunks
-            this.session.sendRealtimeInput([{ mimeType: "audio/pcm;rate=16000", data: pcm16.toString('base64') }]);
+            // Upsample 8k -> 16k
+            const pcm16k = processTwilioAudio(audioBuffer);
+            const base64Audio = pcm16k.toString('base64');
+
+            // Send Realtime Input (JSON)
+            const msg = {
+                realtimeInput: {
+                    mediaChunks: [{
+                        mimeType: "audio/pcm;rate=16000",
+                        data: base64Audio
+                    }]
+                }
+            };
+            this.geminiWs.send(JSON.stringify(msg));
         } catch (e) { }
     }
 
     endSession() {
-        this.session = null;
+        if (this.geminiWs) {
+            this.geminiWs.close();
+            this.geminiWs = null;
+        }
         this.log('Session Ended');
     }
     
