@@ -5,7 +5,7 @@ const API_KEY = process.env.API_KEY;
 const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
-// --- AUDIO MATH ---
+// --- AUDIO MATH (Standard G.711) ---
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
     let u=~i&0xff, s=(u&0x80)?-1:1, e=(u>>4)&0x07, m=u&0x0f;
@@ -56,13 +56,8 @@ export class GeminiService {
     setStreamSid(sid) { this.streamSid = sid; }
 
     log(msg, data = "") {
-        let str = "";
-        if (data instanceof Error) str = data.message;
-        else if (typeof data === 'object') try { str = JSON.stringify(data); } catch { str = "Obj"; }
-        else str = String(data);
-        
-        console.log(`[GEMINI] ${msg} ${str}`);
-        this.onLog({ id: Date.now(), timestamp: new Date().toLocaleTimeString(), message: msg, data: str });
+        console.log(`[GEMINI] ${msg} ${typeof data === 'object' ? JSON.stringify(data) : data}`);
+        this.onLog({ id: Date.now(), timestamp: new Date().toLocaleTimeString(), message: msg, data: String(data) });
     }
 
     async startSession(ws) {
@@ -70,34 +65,29 @@ export class GeminiService {
         this.log('Starting Raw Socket...');
 
         try {
-            // CHECK API KEY FORMAT
-            if (!API_KEY || API_KEY.includes(" ")) {
-                this.log('CRITICAL: API_KEY seems to have spaces or is missing!');
-            }
-
             this.geminiWs = new WebSocket(GEMINI_URL);
 
             this.geminiWs.on('open', () => {
                 this.log('Gemini Socket OPEN.');
                 
-                // SIMPLIFIED SETUP MESSAGE
+                // 1. SETUP (Added TEXT modality)
                 const setupMessage = {
                     setup: {
                         model: MODEL_NAME,
                         generationConfig: {
-                            responseModalities: ["AUDIO"],
+                            responseModalities: ["AUDIO", "TEXT"], // <--- FIX: Request Text back!
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
                         }
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setupMessage));
                 
-                // INITIAL TRIGGER
+                // 2. TRIGGER GREETING
                 const triggerMessage = {
                     clientContent: {
                         turns: [{
                             role: "user",
-                            parts: [{ text: "Здравей, Ема." }]
+                            parts: [{ text: "Здравей, Ема. Представи се." }]
                         }],
                         turnComplete: true
                     }
@@ -109,13 +99,12 @@ export class GeminiService {
                 this.handleGeminiMessage(data);
             });
 
-            this.geminiWs.on('error', (err) => {
-                this.log('SOCKET ERROR', err);
+            this.geminiWs.on('close', (code, reason) => {
+                this.log(`SOCKET CLOSED. Code: ${code}, Reason: ${reason}`);
             });
 
-            this.geminiWs.on('close', (code, reason) => {
-                // THIS LOG IS THE MOST IMPORTANT ONE
-                this.log(`SOCKET CLOSED. Code: ${code}, Reason: ${reason.toString()}`);
+            this.geminiWs.on('error', (err) => {
+                this.log('SOCKET ERROR', err.message);
             });
 
         } catch (error) {
@@ -128,9 +117,18 @@ export class GeminiService {
             const msgStr = data.toString();
             const msg = JSON.parse(msgStr);
 
+            // DEBUG: Log the first text we see to prove it's working
+            if (msg.serverContent?.modelTurn?.parts?.[0]?.text) {
+                console.log("GEMINI SAYS:", msg.serverContent.modelTurn.parts[0].text);
+            }
+
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
-                    if (part.text) this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
+                    // Handle Text
+                    if (part.text) {
+                        this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
+                    }
+                    // Handle Audio
                     if (part.inlineData?.data) {
                         const mulawAudio = processGeminiAudio(part.inlineData.data);
                         if (this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
@@ -143,7 +141,9 @@ export class GeminiService {
                     }
                 }
             }
-        } catch (e) { }
+        } catch (e) { 
+            console.error("Parse Error", e);
+        }
     }
 
     handleAudio(audioBuffer) {
@@ -167,7 +167,7 @@ export class GeminiService {
             this.geminiWs.close();
             this.geminiWs = null;
         }
-        this.log('Session Cleanup');
+        this.log('Session Ended');
     }
     
     async getAvailableSlots() { return {status: "open"}; }
