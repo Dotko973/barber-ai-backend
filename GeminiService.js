@@ -53,7 +53,7 @@ function processGeminiAudio(chunkBase64) {
     const outLen = Math.floor(srcSamples.length / 3);
     const outBuffer = Buffer.alloc(outLen);
     for (let i = 0; i < outLen; i++) {
-        const sample =QDsrcSamples[i * 3];
+        const sample = srcSamples[i * 3];
         // Encode back to Mu-Law (invert bits)
         outBuffer[i] = ~linearToMuLaw(sample);
     }
@@ -117,7 +117,6 @@ export class GeminiService {
             this.sessionPromise = this.ai.live.connect({
                 model: MODEL_NAME,
                 config: {
-                    // IMPORTANT: Request AUDIO and TEXT from the model
                     responseModalities: ["AUDIO", "TEXT"],
                     speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } },
                     tools: [{ functionDeclarations }],
@@ -128,8 +127,7 @@ export class GeminiService {
             this.session = await this.sessionPromise;
             this.log('Connected to Gemini.');
 
-            // IMPORTANT: Enable User Transcription
-            // This tells Gemini: "Please send me the text of what the user says"
+            // Enable User Transcription
             await this.session.send({
                 setup: {
                     model: MODEL_NAME,
@@ -139,7 +137,7 @@ export class GeminiService {
 
             (async () => {
                 try {
-                    for await (constLZ msg of this.session.receive()) {
+                    for await (const msg of this.session.receive()) {
                         this.handleLiveMessage(msg);
                     }
                 } catch (err) {
@@ -167,18 +165,13 @@ export class GeminiService {
 
     handleLiveMessage(message) {
         try {
-            // 1. USER TRANSCRIPT (What YOU said)
-            // The API sends this in 'serverContent.modelTurn' or specialized transcription fields depending on version
-            // We check broadly for transcription data
             const serverContent = message.serverContent;
             
             if (serverContent?.modelTurn?.parts) {
                 for (const part of serverContent.modelTurn.parts) {
-                    // AI Speech/Text
                     if (part.text) {
                         this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
                     }
-                    // AI Audio
                     if (part.inlineData && part.inlineData.data) {
                         const mulawPayload = processGeminiAudio(part.inlineData.data);
                         if(this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
@@ -187,16 +180,6 @@ export class GeminiService {
                     }
                 }
             }
-
-            // 2. USER SPEECH RECOGNITION
-            // Check for input transcription events
-            if (serverContent?.turnComplete || serverContent?.inputAudioTranscription) {
-                // Note: The exact field for user text can vary in 'flash-exp', 
-                // but often comes as a part labeled 'user' in turn history.
-                // For now, we rely on Gemini replying to prove it heard you.
-            }
-            
-            // 3. Tools
             if (message.toolCall) this.handleFunctionCall(message.toolCall);
 
         } catch (error) {
@@ -220,7 +203,7 @@ export class GeminiService {
         this.log('Session ended.');
     }
     
-    // Calendar (Standard)
+    // Calendar
     async getAvailableSlots({ date, barber }) { return { status: "success", message: "Open 09:00-19:00" }; }
     async bookAppointment({ dateTime, barber, clientName }) {
         this.onAppointmentsUpdate();
