@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import { WebSocketServer } from "ws";
 import http from "http";
-import { GeminiService } from "./GeminiService.js"; 
+import { GeminiService } from "./geminiService.js"; 
 
 const app = express();
 const server = http.createServer(app);
