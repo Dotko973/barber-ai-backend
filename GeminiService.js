@@ -6,9 +6,8 @@ const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO MATH (G.711 & Resampling)
+// AUDIO MATH (G.711 Table)
 // =================================================================
-
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
     let u=~i&0xff, s=(u&0x80)?-1:1, e=(u>>4)&0x07, m=u&0x0f;
@@ -22,29 +21,45 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
+// Twilio (8k) -> Gemini (16k)
 function processTwilioAudio(buffer) {
-    const pcm16k = new Int16Array(buffer.length * 2);
-    for (let i = 0; i < buffer.length; i++) {
+    const len = buffer.length;
+    const pcm16k = new Int16Array(len * 2);
+    for (let i = 0; i < len; i++) {
         const s = muLawToPcmTable[buffer[i]];
         pcm16k[i * 2] = s; pcm16k[i * 2 + 1] = s;
     }
     return Buffer.from(pcm16k.buffer);
 }
 
+// Gemini (24k) -> Twilio (8k) - SAFER VERSION
 function processGeminiAudio(chunkBase64) {
+    // 1. Decode Base64 to Buffer
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
-    const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
-    const outLen = Math.floor(srcSamples.length / 3);
+    
+    // 2. Convert to Int16 Array (Little Endian)
+    // Ensure we don't read past end of buffer
+    const numSamples = Math.floor(srcBuffer.length / 2);
+    const srcSamples = new Int16Array(numSamples);
+    for (let i = 0; i < numSamples; i++) {
+        srcSamples[i] = srcBuffer.readInt16LE(i * 2);
+    }
+
+    // 3. Downsample 24k -> 8k (Decimate by 3)
+    const outLen = Math.floor(numSamples / 3);
     const outBuffer = Buffer.alloc(outLen);
+
     for (let i = 0; i < outLen; i++) {
         const val = srcSamples[i * 3];
-        outBuffer[i] = pcmToMuLawMap[val + 32768];
+        // 4. Encode to Mu-Law (Handle Index Offset)
+        outBuffer[i] = pcmToMuLawMap[val + 32768]; 
     }
+    
     return outBuffer;
 }
 
 // =================================================================
-// GEMINI SERVICE (Raw WebSocket)
+// SERVICE
 // =================================================================
 
 export class GeminiService {
@@ -69,7 +84,7 @@ export class GeminiService {
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Connecting Raw Socket...');
+        this.log('Starting Socket...');
 
         try {
             this.geminiWs = new WebSocket(GEMINI_URL);
@@ -77,52 +92,26 @@ export class GeminiService {
             this.geminiWs.on('open', () => {
                 this.log('Gemini Socket OPEN.');
                 
-                // 1. SETUP MESSAGE (Fixed: AUDIO Only)
+                // 1. SETUP (AUDIO ONLY for Stability)
+                // We removed "TEXT" again because that caused the 1007 error before.
+                // Let's get audio working first.
                 const setupMessage = {
                     setup: {
                         model: MODEL_NAME,
                         generationConfig: {
-                            responseModalities: ["AUDIO"], // FIX: Removing "TEXT" fixes Error 1007
+                            responseModalities: ["AUDIO"], 
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
-                        },
-                        systemInstruction: {
-                            parts: [{ text: `Ти си Ема, професионален AI рецепционист в бръснарница "Gentleman's Choice". Говори САМО на Български език. Бъди кратка, учтива и помагай на клиентите да запазят час. Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.` }]
-                        },
-                        tools: [
-                            // Re-adding Calendar Tools
-                            {
-                                functionDeclarations: [
-                                    {
-                                        name: "getAvailableSlots",
-                                        description: "Checks available slots",
-                                        parameters: {
-                                            type: "OBJECT",
-                                            properties: { date: { type: "STRING" }, barber: { type: "STRING" } },
-                                            required: ["date", "barber"]
-                                        }
-                                    },
-                                    {
-                                        name: "bookAppointment",
-                                        description: "Books appointment",
-                                        parameters: {
-                                            type: "OBJECT",
-                                            properties: { dateTime: { type: "STRING" }, barber: { type: "STRING" }, service: { type: "STRING" }, clientName: { type: "STRING" } },
-                                            required: ["dateTime", "barber", "service", "clientName"]
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        }
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setupMessage));
                 
-                // 2. INITIAL GREETING TRIGGER
+                // 2. GREETING
                 const triggerMessage = {
                     clientContent: {
                         turns: [{
                             role: "user",
-                            parts: [{ text: "Здравей! Представи се." }]
+                            parts: [{ text: "Здравей, Ема." }]
                         }],
                         turnComplete: true
                     }
@@ -134,12 +123,12 @@ export class GeminiService {
                 this.handleGeminiMessage(data);
             });
 
-            this.geminiWs.on('error', (err) => {
-                this.log('SOCKET ERROR', err.message);
-            });
-
             this.geminiWs.on('close', (code, reason) => {
                 this.log(`SOCKET CLOSED. Code: ${code}, Reason: ${reason}`);
+            });
+
+            this.geminiWs.on('error', (err) => {
+                this.log('SOCKET ERROR', err.message);
             });
 
         } catch (error) {
@@ -152,12 +141,10 @@ export class GeminiService {
             const msgStr = data.toString();
             const msg = JSON.parse(msgStr);
 
-            // Handle Audio
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
-                    // We log this to prove we are receiving data
                     if (part.inlineData?.data) {
-                        // console.log("[GEMINI] Received Audio Chunk"); 
+                        // Process Audio using Safer Function
                         const mulawAudio = processGeminiAudio(part.inlineData.data);
                         
                         if (this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
@@ -170,37 +157,7 @@ export class GeminiService {
                     }
                 }
             }
-            
-            // Handle Tool Calls
-            if (msg.toolCall) {
-                this.handleFunctionCall(msg.toolCall);
-            }
-
-        } catch (e) { 
-            // console.error("Parse Error", e);
-        }
-    }
-
-    async handleFunctionCall(toolCall) {
-        // Basic Tool Handling Logic
-        for (const fc of toolCall.functionCalls) {
-            this.log(`Tool Call: ${fc.name}`);
-            let result = { result: "Success" };
-            
-            if (fc.name === 'getAvailableSlots') result = await this.getAvailableSlots(fc.args);
-            else if (fc.name === 'bookAppointment') result = await this.bookAppointment(fc.args);
-
-            const response = {
-                toolResponse: {
-                    functionResponses: [{
-                        id: fc.id,
-                        name: fc.name,
-                        response: { result: { object_value: result } }
-                    }]
-                }
-            };
-            this.geminiWs.send(JSON.stringify(response));
-        }
+        } catch (e) { }
     }
 
     handleAudio(audioBuffer) {
@@ -227,7 +184,6 @@ export class GeminiService {
         this.log('Session Ended');
     }
     
-    // Calendar Stubs (To prevent crashes if tools are called)
-    async getAvailableSlots() { return { status: "success", message: "Hours: 09:00 - 19:00" }; }
-    async bookAppointment() { this.onAppointmentsUpdate(); return { status: "success", message: "Booked!" }; }
+    async getAvailableSlots() { return {status: "open"}; }
+    async bookAppointment() { this.onAppointmentsUpdate(); return {status: "booked"}; }
 }
