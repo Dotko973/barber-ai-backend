@@ -2,12 +2,11 @@ import WebSocket from 'ws';
 import { google } from 'googleapis';
 
 const API_KEY = process.env.API_KEY;
-// We use the stable 2.0 Flash Exp model for WebSockets
-const MODEL_NAME = 'models/gemini-2.0-flash-exp'; 
+const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO ENGINE (G.711 Lookup Tables - PROVEN STABLE)
+// AUDIO ENGINE (G.711 Lookup Tables)
 // =================================================================
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
@@ -50,9 +49,7 @@ function processGeminiAudio(chunkBase64) {
 
 export class GeminiService {
     constructor(onTranscript, onLog, onAppointmentsUpdate, oAuth2Client, calendarIds) {
-        this.ws = null;
-        this.geminiWs = null;
-        this.streamSid = null;
+        this.ws = null; this.geminiWs = null; this.streamSid = null;
         this.onTranscript = onTranscript;
         this.onLog = onLog;
         this.onAppointmentsUpdate = onAppointmentsUpdate;
@@ -78,40 +75,31 @@ export class GeminiService {
             this.geminiWs.on('open', () => {
                 this.log('✅ Connected to Google Gemini.');
                 
-                // 1. SETUP (Manager's Logic inserted here)
+                // 1. SETUP
                 const setupMessage = {
                     setup: {
                         model: MODEL_NAME,
                         generationConfig: {
-                            responseModalities: ["AUDIO"], // Audio only prevents errors
+                            responseModalities: ["AUDIO"], 
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
                         },
-                        // --- MANAGER'S SYSTEM INSTRUCTION ---
                         systemInstruction: {
                             parts: [{ text: `
-                                Ти си "Ема", професионален и приятелски настроен AI асистент за "Gentleman's Choice Barbershop". 
+                                Ти си "Ема", професионален AI рецепционист в бръснарница "Gentleman's Choice Barbershop". 
                                 Твоята единствена цел е да помагаш на клиенти да запазват часове. 
-                                Говори **само и единствено на български език**. Не преминавай към английски или руски. 
-                                Бъди кратка и ясна. 
-                                Днешната дата е ${new Date().toLocaleDateString('bg-BG')}. 
-                                Работното време е от 09:00 до 19:00. 
-                                Първо попитай за кой фризьор се интересуват: "Мохамед" или "Джейсън", 
-                                след което провери за свободни часове като използваш предоставените инструменти.
+                                Говори **само и единствено на български език**. 
+                                Бъди кратка. Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.
                             ` }] 
                         },
                         tools: [
-                            // --- MANAGER'S TOOLS ---
                             {
                                 functionDeclarations: [
                                     {
                                         name: "getAvailableSlots",
-                                        description: "Checks for available appointment slots for a specific barber on a given date.",
+                                        description: "Checks for available appointment slots.",
                                         parameters: {
                                             type: "OBJECT",
-                                            properties: { 
-                                                date: { type: "STRING", description: "YYYY-MM-DD" }, 
-                                                barber: { type: "STRING", description: "Name: Мохамед or Джейсън" } 
-                                            },
+                                            properties: { date: { type: "STRING" }, barber: { type: "STRING" } },
                                             required: ["date", "barber"]
                                         }
                                     },
@@ -120,12 +108,7 @@ export class GeminiService {
                                         description: "Books a new appointment.",
                                         parameters: {
                                             type: "OBJECT",
-                                            properties: { 
-                                                dateTime: { type: "STRING", description: "ISO 8601" }, 
-                                                barber: { type: "STRING" }, 
-                                                service: { type: "STRING" }, 
-                                                clientName: { type: "STRING" } 
-                                            },
+                                            properties: { dateTime: { type: "STRING" }, barber: { type: "STRING" }, service: { type: "STRING" }, clientName: { type: "STRING" } },
                                             required: ["dateTime", "barber", "service", "clientName"]
                                         }
                                     }
@@ -136,8 +119,8 @@ export class GeminiService {
                 };
                 this.geminiWs.send(JSON.stringify(setupMessage));
                 
-                // 2. KICKSTART (Force Hello)
-                // We add this so you know it's working immediately
+                // 2. TRIGGER (THE WAKE UP CALL)
+                // This forces Gemini to generate audio immediately.
                 const triggerMessage = {
                     clientContent: {
                         turns: [{
@@ -148,6 +131,7 @@ export class GeminiService {
                     }
                 };
                 this.geminiWs.send(JSON.stringify(triggerMessage));
+                this.log('🔔 Kickstart Trigger Sent.');
             });
 
             this.geminiWs.on('message', (data) => {
@@ -171,7 +155,6 @@ export class GeminiService {
         try {
             const msg = JSON.parse(data.toString());
             
-            // Audio Response
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.data) {
@@ -186,12 +169,9 @@ export class GeminiService {
                     }
                 }
             }
-            
-            // Tool Calls (Logic)
             if (msg.toolCall) {
                 this.handleFunctionCall(msg.toolCall);
             }
-
         } catch (e) { }
     }
 
@@ -243,14 +223,11 @@ export class GeminiService {
         this.log('Session Ended');
     }
     
-    // --- MANAGER'S CALENDAR LOGIC (Restored) ---
-    
     async getAvailableSlots({ date, barber }) {
         this.log(`Checking Calendar: ${barber} on ${date}`);
         const calendarId = this.calendarIds[barber] || 'primary';
         const startOfDay = new Date(`${date}T09:00:00`);
         const endOfDay = new Date(`${date}T19:00:00`);
-
         try {
             const response = await this.googleCalendar.events.list({
                 calendarId,
@@ -259,22 +236,11 @@ export class GeminiService {
                 singleEvents: true,
                 orderBy: 'startTime',
             });
-            
-            // Logic: Find gaps or just return existing events so AI figures it out
-            // Simplifying for reliability: Return list of BUSY times. AI can calculate free times.
             const busyTimes = response.data.items.map(event => {
                 const start = new Date(event.start.dateTime);
-                const end = new Date(event.end.dateTime);
-                return `${start.getHours()}:${start.getMinutes()} - ${end.getHours()}:${end.getMinutes()}`;
+                return `${start.getHours()}:${start.getMinutes()}`;
             });
-
-            return { 
-                status: "success", 
-                date: date,
-                barber: barber,
-                busy_slots: busyTimes,
-                message: "The barber is busy at these times. All other 30-min slots between 09:00 and 19:00 are free."
-            };
+            return { status: "success", busy_slots: busyTimes, message: "Shop is open 09:00-19:00" };
         } catch (error) {
             this.log('Calendar Error', error);
             return { error: "Failed to check calendar." };
@@ -284,24 +250,21 @@ export class GeminiService {
     async bookAppointment({ dateTime, barber, service, clientName }) {
         this.log(`Booking: ${clientName} for ${dateTime}`);
         const calendarId = this.calendarIds[barber] || 'primary';
-        
-        const start = new Date(dateTime);
-        const end = new Date(start.getTime() + 30 * 60000); // 30 mins
-
-        const event = {
-            summary: `${service} - ${clientName}`,
-            description: `Booked by AI for ${barber}`,
-            start: { dateTime: start.toISOString(), timeZone: 'Europe/Sofia' },
-            end: { dateTime: end.toISOString(), timeZone: 'Europe/Sofia' },
-        };
-
         try {
+            const start = new Date(dateTime);
+            const end = new Date(start.getTime() + 30 * 60000);
+            const event = {
+                summary: `${service} - ${clientName}`,
+                description: `Booked by AI`,
+                start: { dateTime: start.toISOString() },
+                end: { dateTime: end.toISOString() },
+            };
             await this.googleCalendar.events.insert({ calendarId, resource: event });
-            this.onAppointmentsUpdate(); // Refresh Dashboard
-            return { success: true, message: "Appointment confirmed." };
+            this.onAppointmentsUpdate(); 
+            return { success: true, message: "Confirmed." };
         } catch (error) {
             this.log('Booking Error', error);
-            return { error: "Failed to book appointment." };
+            return { error: "Failed to book." };
         }
     }
-} 
+}
