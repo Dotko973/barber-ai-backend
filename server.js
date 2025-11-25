@@ -6,16 +6,13 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import { WebSocketServer } from "ws";
 import http from "http";
-// Import the GeminiService class
 import { GeminiService } from "./GeminiService.js"; 
 
-// Create Express app
 const app = express();
-// Create HTTP server (needed for WebSockets)
 const server = http.createServer(app);
 
 // ----------------------------------------------------
-// GLOBAL CORS CONFIG
+// CONFIG
 // ----------------------------------------------------
 const allowedOrigins = [
   "http://localhost:5173",
@@ -29,7 +26,7 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      callback(null, true); // Allow all for testing if needed
+      callback(null, true);
     }
   },
   credentials: true,
@@ -38,15 +35,12 @@ app.use(cors({
 }));
 
 app.use(bodyParser.json());
-// Handle Twilio form data
 app.use(bodyParser.urlencoded({ extended: false }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===============================
-// GOOGLE CALENDAR AUTH
-// ===============================
+// GOOGLE CALENDAR
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -58,18 +52,10 @@ oauth2Client.setCredentials({
 });
 
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+const calendarIds = { "Мохамед": "primary", "Джейсън": "primary" };
 
-// Define Calendar IDs 
-const calendarIds = {
-  "Мохамед": "primary", 
-  "Джейсън": "primary" 
-};
-
-// ===============================
-// SSE (Frontend Live Updates)
-// ===============================
+// SSE SETUP
 let sseClients = [];
-
 function broadcastToFrontend(type, data) {
   sseClients.forEach(client => {
     if (!client.res.writableEnded) {
@@ -83,24 +69,21 @@ app.get("/api/events", (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   if (res.flushHeaders) res.flushHeaders();
-
   const clientId = Date.now();
   sseClients.push({ id: clientId, res });
-
-  // Initial message to turn the dot Green
-  res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Backend Realtime Stream" } })}\n\n`);
-
-  req.on("close", () => {
-    sseClients = sseClients.filter(c => c.id !== clientId);
-  });
+  res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Backend" } })}\n\n`);
+  req.on("close", () => { sseClients = sseClients.filter(c => c.id !== clientId); });
 });
 
-// ===============================
-// TWILIO INCOMING CALL (Route)
-// ===============================
+// ----------------------------------------------------
+// TWILIO HANDLER (THE FIX IS HERE)
+// ----------------------------------------------------
 app.post("/incoming-call", (req, res) => {
   console.log("Incoming call received!");
   const host = req.headers.host; 
+  
+  // REMOVED: <Say language="bg-BG">...</Say>
+  // We connect IMMEDIATELY to the AI stream.
   const twiml = `
     <Response>
       <Connect>
@@ -108,13 +91,12 @@ app.post("/incoming-call", (req, res) => {
       </Connect>
     </Response>
   `;
-  res.type("text/xml");
-  res.send(twiml);
+  res.type("text/xml").send(twiml);
 });
 
-// ===============================
-// WEBSOCKET SERVER (Twilio Audio Stream)
-// ===============================
+// ----------------------------------------------------
+// WEBSOCKET SERVER
+// ----------------------------------------------------
 const wss = new WebSocketServer({ server, path: "/connection" });
 
 wss.on("connection", (ws) => {
@@ -132,42 +114,29 @@ wss.on("connection", (ws) => {
     calendarIds
   );
 
-  // NOTE: Removed gemini.startSession(ws) from here. 
-  // We wait for the "start" event below to ensure we have the streamSid.
-
   ws.on("message", (message) => {
     try {
       const data = JSON.parse(message);
-      
       if (data.event === "start") {
-        console.log("Twilio Stream Started:", data.start.streamSid);
-        // 1. Set the Stream SID
+        console.log("Stream Started:", data.start.streamSid);
         gemini.setStreamSid(data.start.streamSid);
-        // 2. Start the AI Session
         gemini.startSession(ws);
       }
       else if (data.event === "media") {
-        const audioBuffer = Buffer.from(data.media.payload, "base64");
-        gemini.handleAudio(audioBuffer);
+        gemini.handleAudio(Buffer.from(data.media.payload, "base64"));
       } 
       else if (data.event === "stop") {
-        console.log("Twilio Stream Stopped");
         gemini.endSession();
       }
     } catch (error) {
-      console.error("Error processing WebSocket message:", error);
+      console.error("WS Error:", error);
     }
   });
 
-  ws.on("close", () => {
-    console.log("Twilio Media Stream Disconnected");
-    gemini.endSession();
-  });
+  ws.on("close", () => gemini.endSession());
 });
 
-// ===============================
-// STANDARD API ROUTES
-// ===============================
+// API ROUTES
 app.get("/", (req, res) => res.send("Barbershop AI Backend"));
 app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
 
@@ -180,7 +149,6 @@ app.get("/api/test-calendar", async (req, res) => {
   }
 });
 
-// ✅ THIS IS THE MISSING ROUTE THAT FIXES THE DASHBOARD
 app.get("/appointments", async (req, res) => {
   try {
     const response = await calendar.events.list({
@@ -190,7 +158,6 @@ app.get("/appointments", async (req, res) => {
       singleEvents: true,
       orderBy: 'startTime',
     });
-
     const appointments = response.data.items.map(event => {
       const start = new Date(event.start.dateTime || event.start.date);
       return {
@@ -202,17 +169,11 @@ app.get("/appointments", async (req, res) => {
     });
     res.json(appointments);
   } catch (error) {
-    console.error("Error fetching appointments:", error);
-    // Return empty array to keep dashboard alive
     res.json([]); 
   }
 });
 
-// ===============================
-// START SERVER
-// ===============================
 const PORT = process.env.PORT || 3000;
-
 server.listen(PORT, () => {
   console.log(`✅ Barbershop backend running on port ${PORT}`);
 });
