@@ -181,7 +181,7 @@ app.get("/api/test-calendar", async (req, res) => {
 });
 
 // ✅ THIS IS THE MISSING ROUTE THAT FIXES THE DASHBOARD
-app.get("/api/appointments", async (req, res) => {
+app.get("/appointments", async (req, res) => {
   try {
     const response = await calendar.events.list({
       calendarId: 'primary',
