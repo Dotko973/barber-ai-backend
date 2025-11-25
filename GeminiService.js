@@ -6,7 +6,7 @@ const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO ENGINE
+// AUDIO MATH (G.711 Safe Mode)
 // =================================================================
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
@@ -20,32 +20,28 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
-// 1. SMOOTH UPSAMPLING (Twilio 8k -> Gemini 16k)
 function processTwilioAudio(buffer) {
-    const len = buffer.length;
-    const pcm16k = new Int16Array(len * 2);
-    for (let i = 0; i < len - 1; i++) {
-        const s1 = muLawToPcmTable[buffer[i]];
-        const s2 = muLawToPcmTable[buffer[i+1]];
-        pcm16k[i * 2] = s1;
-        pcm16k[i * 2 + 1] = (s1 + s2) >> 1; // Average (Smooths the jagged edges)
+    const pcm16k = new Int16Array(buffer.length * 2);
+    for (let i = 0; i < buffer.length; i++) {
+        const s = muLawToPcmTable[buffer[i]];
+        pcm16k[i * 2] = s; pcm16k[i * 2 + 1] = s;
     }
-    // Handle last sample
-    const last = muLawToPcmTable[buffer[len-1]];
-    pcm16k[len*2 - 2] = last;
-    pcm16k[len*2 - 1] = last;
     return Buffer.from(pcm16k.buffer);
 }
 
-// 2. DOWNSAMPLING (Gemini 24k -> Twilio 8k)
 function processGeminiAudio(chunkBase64) {
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
-    const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
-    const outLen = Math.floor(srcSamples.length / 3);
+    // Safe Little Endian Read
+    const numSamples = Math.floor(srcBuffer.length / 2);
+    const outLen = Math.floor(numSamples / 3);
     const outBuffer = Buffer.alloc(outLen);
     for (let i = 0; i < outLen; i++) {
-        const val = srcSamples[i * 3];
-        outBuffer[i] = pcmToMuLawMap[val + 32768];
+        // i * 3 * 2 bytes per sample
+        const offset = i * 6;
+        if (offset + 1 < srcBuffer.length) {
+            const val = srcBuffer.readInt16LE(offset);
+            outBuffer[i] = pcmToMuLawMap[val + 32768];
+        }
     }
     return outBuffer;
 }
@@ -56,22 +52,27 @@ function processGeminiAudio(chunkBase64) {
 
 export class GeminiService {
     constructor(onTranscript, onLog, onAppointmentsUpdate, oAuth2Client, calendarIds) {
-        this.ws = null; this.geminiWs = null; this.streamSid = null;
-        this.onTranscript = onTranscript; this.onLog = onLog; this.onAppointmentsUpdate = onAppointmentsUpdate;
-        this.oAuth2Client = oAuth2Client; this.calendarIds = calendarIds;
+        this.ws = null;
+        this.geminiWs = null;
+        this.streamSid = null;
+        this.onTranscript = onTranscript;
+        this.onLog = onLog;
+        this.onAppointmentsUpdate = onAppointmentsUpdate;
+        this.oAuth2Client = oAuth2Client;
+        this.calendarIds = calendarIds;
         this.googleCalendar = google.calendar({ version: 'v3', auth: this.oAuth2Client });
     }
 
     setStreamSid(sid) { this.streamSid = sid; }
 
     log(msg, data = "") {
-        console.log(`[GEMINI] ${msg}`);
+        console.log(`[GEMINI] ${msg} ${typeof data === 'object' ? JSON.stringify(data) : data}`);
         this.onLog({ id: Date.now(), timestamp: new Date().toLocaleTimeString(), message: msg, data: String(data) });
     }
 
     async startSession(ws) {
         this.ws = ws;
-        this.log('Connecting...');
+        this.log('Connecting to Google...');
 
         try {
             this.geminiWs = new WebSocket(GEMINI_URL);
@@ -79,114 +80,161 @@ export class GeminiService {
             this.geminiWs.on('open', () => {
                 this.log('✅ Connected.');
                 
-                // 1. SETUP (With Text + Audio Transcription)
+                // 1. SETUP (AUDIO ONLY - THIS FIXES ERROR 1007)
                 const setupMessage = {
                     setup: {
                         model: MODEL_NAME,
                         generationConfig: {
-                            responseModalities: ["AUDIO", "TEXT"], // Enable Text for Dashboard
+                            responseModalities: ["AUDIO"], // <--- ONLY AUDIO
                             speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } } }
                         },
-                        // INSTRUCTIONS
-                        systemInstruction: { parts: [{ text: `
-                            Ти си Ема, телефонен рецепционист. 
-                            Говори само на Български.
-                            Цел: Запази час (bookAppointment).
-                            Когато говориш, бъди кратка.
-                        ` }] },
-                        // TOOLS
-                        tools: [{ functionDeclarations: [
+                        systemInstruction: {
+                            parts: [{ text: `
+                                Ти си Ема, рецепционист в Gentleman's Choice. 
+                                Говори САМО на Български език. 
+                                Бъди кратка. Поздрави клиента веднага.
+                                Днес е ${new Date().toLocaleDateString('bg-BG')}.
+                            ` }]
+                        },
+                        tools: [
                             {
-                                name: "getAvailableSlots",
-                                description: "Check slots",
-                                parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, barber: { type: "STRING" } }, required: ["date", "barber"] }
-                            },
-                            {
-                                name: "bookAppointment",
-                                description: "Book appointment",
-                                parameters: { type: "OBJECT", properties: { dateTime: { type: "STRING" }, barber: { type: "STRING" }, service: { type: "STRING" }, clientName: { type: "STRING" } }, required: ["dateTime", "barber", "service", "clientName"] }
+                                functionDeclarations: [
+                                    {
+                                        name: "getAvailableSlots",
+                                        description: "Check slots",
+                                        parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, barber: { type: "STRING" } }, required: ["date", "barber"] }
+                                    },
+                                    {
+                                        name: "bookAppointment",
+                                        description: "Book appointment",
+                                        parameters: { type: "OBJECT", properties: { dateTime: { type: "STRING" }, barber: { type: "STRING" }, service: { type: "STRING" }, clientName: { type: "STRING" } }, required: ["dateTime", "barber", "service", "clientName"] }
+                                    }
+                                ]
                             }
-                        ]}]
+                        ]
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setupMessage));
-
-                // 2. GREETING TRIGGER
-                this.geminiWs.send(JSON.stringify({
+                
+                // 2. KICKSTART (Forces her to speak)
+                const triggerMessage = {
                     clientContent: {
-                        turns: [{ role: "user", parts: [{ text: "Start conversation now." }] }],
+                        turns: [{
+                            role: "user",
+                            parts: [{ text: "Здравей. Започни разговора." }]
+                        }],
                         turnComplete: true
                     }
-                }));
+                };
+                this.geminiWs.send(JSON.stringify(triggerMessage));
+                this.log('Kickstart Sent.');
             });
 
-            this.geminiWs.on('message', (data) => this.handleGeminiMessage(data));
-            this.geminiWs.on('close', (c, r) => this.log(`Socket Closed: ${c}`));
-            this.geminiWs.on('error', (e) => this.log(`Socket Error: ${e.message}`));
+            this.geminiWs.on('message', (data) => {
+                this.handleGeminiMessage(data);
+            });
 
-        } catch (e) { this.log('Init Error', e); }
+            this.geminiWs.on('close', (code, reason) => {
+                this.log(`SOCKET CLOSED. Code: ${code}, Reason: ${reason}`);
+            });
+
+            this.geminiWs.on('error', (err) => {
+                this.log('SOCKET ERROR', err.message);
+            });
+
+        } catch (error) {
+            this.log('Init Error', error);
+        }
     }
 
     handleGeminiMessage(data) {
         try {
             const msg = JSON.parse(data.toString());
-
-            // 1. HANDLE TEXT (AI Response)
+            
+            // Handle Audio
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
-                    if (part.text) {
-                        this.onTranscript({ id: Date.now(), speaker: 'ai', text: part.text });
-                    }
                     if (part.inlineData?.data) {
                         const mulawAudio = processGeminiAudio(part.inlineData.data);
-                        if (this.ws && this.ws.readyState === 1 && this.streamSid) {
-                            this.ws.send(JSON.stringify({ event: 'media', streamSid: this.streamSid, media: { payload: mulawAudio.toString('base64') } }));
+                        if (this.ws && this.ws.readyState === this.ws.OPEN && this.streamSid) {
+                            this.ws.send(JSON.stringify({
+                                event: 'media',
+                                streamSid: this.streamSid,
+                                media: { payload: mulawAudio.toString('base64') }
+                            }));
                         }
                     }
                 }
             }
 
-            // 2. HANDLE TOOL CALLS
-            if (msg.toolCall) this.handleFunctionCall(msg.toolCall);
+            // Handle Tools
+            if (msg.toolCall) {
+                this.handleFunctionCall(msg.toolCall);
+            }
 
-        } catch (e) {}
+        } catch (e) { }
     }
 
     async handleFunctionCall(toolCall) {
         for (const fc of toolCall.functionCalls) {
             this.log(`Tool: ${fc.name}`, fc.args);
             let result = { result: "Success" };
+            
             if (fc.name === 'getAvailableSlots') result = await this.getAvailableSlots(fc.args);
             else if (fc.name === 'bookAppointment') result = await this.bookAppointment(fc.args);
 
-            this.geminiWs.send(JSON.stringify({ toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response: { result: { object_value: result } } }] } }));
+            const response = {
+                toolResponse: {
+                    functionResponses: [{
+                        id: fc.id,
+                        name: fc.name,
+                        response: { result: { object_value: result } }
+                    }]
+                }
+            };
+            this.geminiWs.send(JSON.stringify(response));
         }
     }
 
     handleAudio(buffer) {
-        if (!this.geminiWs || this.geminiWs.readyState !== 1) return;
+        if (!this.geminiWs || this.geminiWs.readyState !== WebSocket.OPEN) return;
         try {
             const pcm16 = processTwilioAudio(buffer);
-            this.geminiWs.send(JSON.stringify({
-                realtimeInput: { mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: pcm16.toString('base64') }] }
-            }));
-        } catch (e) {}
+            const msg = {
+                realtimeInput: {
+                    mediaChunks: [{
+                        mimeType: "audio/pcm;rate=16000",
+                        data: pcm16.toString('base64')
+                    }]
+                }
+            };
+            this.geminiWs.send(JSON.stringify(msg));
+        } catch (e) { }
     }
 
-    endSession() { if (this.geminiWs) this.geminiWs.close(); }
+    endSession() {
+        if (this.geminiWs) this.geminiWs.close();
+    }
     
+    // --- CALENDAR ---
     async getAvailableSlots({ date, barber }) {
         const calendarId = this.calendarIds[barber] || 'primary';
         try {
             const res = await this.googleCalendar.events.list({ calendarId, timeMin: new Date(`${date}T09:00:00`).toISOString(), timeMax: new Date(`${date}T19:00:00`).toISOString(), singleEvents: true });
-            return { status: "success", busy: res.data.items.map(e => e.start.dateTime) };
-        } catch (e) { return { error: "Calendar error" }; }
+            const busy = res.data.items.map(e => e.start.dateTime);
+            return { status: "success", busy_slots: busy };
+        } catch (e) { return { error: "Calendar unavailable" }; }
     }
 
     async bookAppointment({ dateTime, barber, service, clientName }) {
         const calendarId = this.calendarIds[barber] || 'primary';
         try {
-            await this.googleCalendar.events.insert({ calendarId, resource: { summary: `${service} - ${clientName}`, start: { dateTime: new Date(dateTime).toISOString() }, end: { dateTime: new Date(new Date(dateTime).getTime()+30*60000).toISOString() } } });
+            const start = new Date(dateTime);
+            const end = new Date(start.getTime() + 30*60000);
+            await this.googleCalendar.events.insert({
+                calendarId,
+                resource: { summary: `${service} - ${clientName}`, description: `Barber: ${barber}`, start: { dateTime: start.toISOString() }, end: { dateTime: end.toISOString() } }
+            });
             this.onAppointmentsUpdate();
             return { success: true };
         } catch (e) { return { error: "Booking failed" }; }
