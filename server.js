@@ -11,50 +11,33 @@ import { GeminiService } from "./GeminiService.js";
 const app = express();
 const server = http.createServer(app);
 
-// ----------------------------------------------------
-// CONFIG
-// ----------------------------------------------------
-const allowedOrigins = [
-  "http://localhost:5173",
-  "https://excellent-range-296913.web.app",
-  "https://excellent-range-296913.firebaseapp.com"
-];
+// --- CRASH CATCHER (Prevents "Application Error") ---
+process.on('uncaughtException', (err) => {
+  console.error('🔥 UNCAUGHT EXCEPTION:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🔥 UNHANDLED REJECTION:', reason);
+});
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(null, true);
-    }
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
+// --- MIDDLEWARE ---
+app.use(cors({ origin: true })); // Allow all for debug
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// GOOGLE CALENDAR
+// --- GOOGLE AUTH ---
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
   process.env.GOOGLE_REDIRECT_URI
 );
-
-oauth2Client.setCredentials({
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-});
-
+oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 const calendarIds = { "Мохамед": "primary", "Джейсън": "primary" };
 
-// SSE SETUP
+// --- SSE ---
 let sseClients = [];
 function broadcastToFrontend(type, data) {
   sseClients.forEach(client => {
@@ -72,20 +55,37 @@ app.get("/api/events", (req, res) => {
   const clientId = Date.now();
   sseClients.push({ id: clientId, res });
   res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Backend" } })}\n\n`);
-  req.on("close", () => { sseClients = sseClients.filter(c => c.id !== clientId); });
+  req.on("close", () => sseClients = sseClients.filter(c => c.id !== clientId));
 });
 
-// ----------------------------------------------------
-// TWILIO HANDLER (THE FIX IS HERE)
-// ----------------------------------------------------
+// --- ROUTES ---
+app.get("/", (req, res) => res.send("Barbershop Backend Running"));
+app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
+app.get("/appointments", (req, res) => res.redirect("/api/appointments")); // Fix frontend mismatch
+app.get("/api/appointments", async (req, res) => {
+  try {
+    const response = await calendar.events.list({
+      calendarId: 'primary', timeMin: new Date().toISOString(), maxResults: 10, singleEvents: true, orderBy: 'startTime',
+    });
+    const appointments = response.data.items.map(e => ({
+      id: e.id, customerName: e.summary || "Busy", 
+      date: new Date(e.start.dateTime).toLocaleDateString(), 
+      time: new Date(e.start.dateTime).toLocaleTimeString()
+    }));
+    res.json(appointments);
+  } catch (error) { res.json([]); }
+});
+
+// --- TWILIO WEBHOOK (Safe Mode) ---
 app.post("/incoming-call", (req, res) => {
-  console.log("Incoming call received!");
+  console.log("📞 Incoming call received!");
   const host = req.headers.host; 
   
-  // REMOVED: <Say language="bg-BG">...</Say>
-  // We connect IMMEDIATELY to the AI stream.
+  // Using English greeting to prevent Twilio 13512 Error
+  // The AI will speak Bulgarian afterwards.
   const twiml = `
     <Response>
+      <Say>Connecting you to Emma.</Say>
       <Connect>
         <Stream url="wss://${host}/connection" />
       </Connect>
@@ -94,31 +94,24 @@ app.post("/incoming-call", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// ----------------------------------------------------
-// WEBSOCKET SERVER
-// ----------------------------------------------------
+// --- WEBSOCKET ---
 const wss = new WebSocketServer({ server, path: "/connection" });
 
 wss.on("connection", (ws) => {
-  console.log("Twilio Media Stream Connected");
-
-  const onTranscript = (data) => broadcastToFrontend("transcript", data);
-  const onLog = (data) => broadcastToFrontend("log", data);
-  const onAppointmentsUpdate = () => broadcastToFrontend("appointment_update", { message: "New appointment booked!" });
+  console.log("✅ Twilio Media Stream Connected");
 
   const gemini = new GeminiService(
-    onTranscript,
-    onLog,
-    onAppointmentsUpdate,
-    oauth2Client,
-    calendarIds
+    (data) => broadcastToFrontend("transcript", data),
+    (data) => broadcastToFrontend("log", data),
+    () => broadcastToFrontend("appointment_update", { message: "Booked!" }),
+    oauth2Client, calendarIds
   );
 
   ws.on("message", (message) => {
     try {
       const data = JSON.parse(message);
       if (data.event === "start") {
-        console.log("Stream Started:", data.start.streamSid);
+        console.log("▶️ Stream Started:", data.start.streamSid);
         gemini.setStreamSid(data.start.streamSid);
         gemini.startSession(ws);
       }
@@ -126,57 +119,19 @@ wss.on("connection", (ws) => {
         gemini.handleAudio(Buffer.from(data.media.payload, "base64"));
       } 
       else if (data.event === "stop") {
+        console.log("⏹️ Stream Stopped");
         gemini.endSession();
       }
     } catch (error) {
-      console.error("WS Error:", error);
+      console.error("WS Parsing Error:", error);
     }
   });
 
   ws.on("close", () => gemini.endSession());
 });
 
-// API ROUTES
-app.get("/", (req, res) => res.send("Barbershop AI Backend"));
-app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
-
-app.get("/api/test-calendar", async (req, res) => {
-  try {
-    await calendar.calendarList.list();
-    res.json({ success: true, message: "Calendar service ready." });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Calendar not init." });
-  }
-});
-
-app.get("/appointments", async (req, res) => {
-  try {
-    const response = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: new Date().toISOString(),
-      maxResults: 10,
-      singleEvents: true,
-      orderBy: 'startTime',
-    });
-    const appointments = response.data.items.map(event => {
-      const start = new Date(event.start.dateTime || event.start.date);
-      return {
-        id: event.id,
-        customerName: event.summary || "Busy",
-        date: start.toLocaleDateString(),
-        time: start.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
-    });
-    res.json(appointments);
-  } catch (error) {
-    res.json([]); 
-  }
-});
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`✅ Barbershop backend running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 
 
 
