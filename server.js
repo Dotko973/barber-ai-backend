@@ -6,36 +6,41 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import { WebSocketServer } from "ws";
 import http from "http";
-
-// IMPORT WITH LOWERCASE 'g' (Matches Linux file system)
-import { GeminiService } from "./geminiService.js"; 
+import { GeminiService } from "./GeminiService.js"; 
 
 const app = express();
 const server = http.createServer(app);
 
-// --- GLOBAL CRASH HANDLERS (Crucial for logs) ---
-process.on('uncaughtException', (err) => {
-  console.error('🔥 FATAL UNCAUGHT EXCEPTION:', err);
-});
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('🔥 FATAL UNHANDLED REJECTION:', reason);
-});
-
-app.use(cors({ origin: true }));
+// --- MIDDLEWARE ---
+app.use(cors({ origin: true })); 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// --- GOOGLE CALENDAR AUTH ---
 const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, process.env.GOOGLE_REDIRECT_URI
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
 );
-oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+
+// Critical: If this token is bad, everything fails
+oauth2Client.setCredentials({
+  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+});
+
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 const calendarIds = { "Мохамед": "primary", "Джейсън": "primary" };
 
+// --- SSE BROADCAST ---
 let sseClients = [];
 function broadcastToFrontend(type, data) {
   sseClients.forEach(client => {
-    if (!client.res.writableEnded) client.res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
+    if (!client.res.writableEnded) {
+      client.res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
+    }
   });
 }
 
@@ -44,64 +49,108 @@ app.get("/api/events", (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   if (res.flushHeaders) res.flushHeaders();
+
   const clientId = Date.now();
   sseClients.push({ id: clientId, res });
-  res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected" } })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Backend" } })}\n\n`);
   req.on("close", () => sseClients = sseClients.filter(c => c.id !== clientId));
 });
 
-app.get("/", (req, res) => res.send("Backend Running"));
-app.get("/api", (req, res) => res.json({ status: "Ready" }));
-app.get("/appointments", (req, res) => res.redirect("/api/appointments"));
-app.get("/api/appointments", async (req, res) => {
+// --- ROUTES ---
+app.get("/", (req, res) => res.send("Barbershop Backend Running"));
+
+// 1. Health Check
+app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
+
+// 2. Calendar Test (This is what the Dashboard checks)
+app.get("/api/test-calendar", async (req, res) => {
+  console.log("Testing Calendar Connection...");
   try {
-    const response = await calendar.events.list({ calendarId: 'primary', maxResults: 5 });
-    res.json(response.data.items);
-  } catch (e) { res.json([]); }
+    const response = await calendar.calendarList.list();
+    console.log("Calendar Connection Success");
+    res.json({ success: true, message: "Google Calendar is connected!" });
+  } catch (error) {
+    console.error("Google Calendar Error:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
+// 3. Appointments List
+app.get("/api/appointments", async (req, res) => {
+  try {
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: new Date().toISOString(),
+      maxResults: 10,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+    const appointments = response.data.items.map(event => {
+      const start = new Date(event.start.dateTime || event.start.date);
+      return {
+        id: event.id,
+        customerName: event.summary || "Busy",
+        date: start.toLocaleDateString('bg-BG'),
+        time: start.toLocaleTimeString('bg-BG', { hour: '2-digit', minute: '2-digit' })
+      };
+    });
+    res.json(appointments);
+  } catch (error) {
+    console.error("Fetch Appointments Error:", error.message);
+    res.json([]); // Return empty array instead of crashing dashboard
+  }
+});
+
+// --- TWILIO HANDLER ---
 app.post("/incoming-call", (req, res) => {
-  console.log("📞 Incoming Call");
   const host = req.headers.host; 
-  res.type("text/xml").send(`
+  const twiml = `
     <Response>
       <Connect>
         <Stream url="wss://${host}/connection" />
       </Connect>
     </Response>
-  `);
+  `;
+  res.type("text/xml").send(twiml);
 });
 
+// --- WEBSOCKET ---
 const wss = new WebSocketServer({ server, path: "/connection" });
 
 wss.on("connection", (ws) => {
-  console.log("✅ Socket Connected");
+  console.log("Twilio Connected");
+  
   const gemini = new GeminiService(
     (d) => broadcastToFrontend("transcript", d),
     (d) => broadcastToFrontend("log", d),
-    () => broadcastToFrontend("appointment_update", {}),
+    () => broadcastToFrontend("appointment_update", { message: "Booked!" }),
     oauth2Client, calendarIds
   );
 
-  ws.on("message", (msg) => {
+  ws.on("message", (message) => {
     try {
-      const data = JSON.parse(msg);
+      const data = JSON.parse(message);
       if (data.event === "start") {
-        console.log("▶️ Stream Start");
+        console.log("Stream Started:", data.start.streamSid);
         gemini.setStreamSid(data.start.streamSid);
         gemini.startSession(ws);
-      } else if (data.event === "media") {
+      }
+      else if (data.event === "media") {
         gemini.handleAudio(Buffer.from(data.media.payload, "base64"));
-      } else if (data.event === "stop") {
+      } 
+      else if (data.event === "stop") {
         gemini.endSession();
       }
-    } catch (e) { console.error("WS Error", e); }
+    } catch (error) { }
   });
+
   ws.on("close", () => gemini.endSession());
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`✅ Barbershop backend running on port ${PORT}`);
+});
 
 
 
