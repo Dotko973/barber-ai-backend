@@ -6,28 +6,28 @@ import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import { WebSocketServer } from "ws";
 import http from "http";
-import { GeminiService } from "./GeminiService.js"; 
+
+// --- FIX: IMPORT WITH LOWERCASE 'g' TO MATCH LINUX SERVER FILE ---
+import { GeminiService } from "./geminiService.js"; 
+
+// --- CRASH HANDLING (Prints errors to Azure Logs) ---
+process.on('uncaughtException', (err) => {
+  console.error('🔥 FATAL UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🔥 FATAL UNHANDLED REJECTION:', reason);
+});
 
 const app = express();
 const server = http.createServer(app);
 
-// --- CRASH CATCHER (Prevents "Application Error") ---
-process.on('uncaughtException', (err) => {
-  console.error('🔥 UNCAUGHT EXCEPTION:', err);
-});
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('🔥 UNHANDLED REJECTION:', reason);
-});
-
-// --- MIDDLEWARE ---
-app.use(cors({ origin: true })); // Allow all for debug
+// MIDDLEWARE
+app.use(cors({ origin: true }));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: false }));
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// --- GOOGLE AUTH ---
+// GOOGLE AUTH
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
@@ -37,13 +37,11 @@ oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN })
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 const calendarIds = { "Мохамед": "primary", "Джейсън": "primary" };
 
-// --- SSE ---
+// SSE LOGGING
 let sseClients = [];
 function broadcastToFrontend(type, data) {
   sseClients.forEach(client => {
-    if (!client.res.writableEnded) {
-      client.res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
-    }
+    if (!client.res.writableEnded) client.res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
   });
 }
 
@@ -58,10 +56,10 @@ app.get("/api/events", (req, res) => {
   req.on("close", () => sseClients = sseClients.filter(c => c.id !== clientId));
 });
 
-// --- ROUTES ---
+// ROUTES
 app.get("/", (req, res) => res.send("Barbershop Backend Running"));
 app.get("/api", (req, res) => res.json({ status: "Backend is ready" }));
-app.get("/appointments", (req, res) => res.redirect("/api/appointments")); // Fix frontend mismatch
+app.get("/appointments", (req, res) => res.redirect("/api/appointments"));
 app.get("/api/appointments", async (req, res) => {
   try {
     const response = await calendar.events.list({
@@ -73,19 +71,15 @@ app.get("/api/appointments", async (req, res) => {
       time: new Date(e.start.dateTime).toLocaleTimeString()
     }));
     res.json(appointments);
-  } catch (error) { res.json([]); }
+  } catch (error) { console.error("Calendar Error:", error); res.json([]); }
 });
 
-// --- TWILIO WEBHOOK (Safe Mode) ---
+// TWILIO HANDLER
 app.post("/incoming-call", (req, res) => {
   console.log("📞 Incoming call received!");
   const host = req.headers.host; 
-  
-  // Using English greeting to prevent Twilio 13512 Error
-  // The AI will speak Bulgarian afterwards.
   const twiml = `
     <Response>
-      <Say>Connecting you to Emma.</Say>
       <Connect>
         <Stream url="wss://${host}/connection" />
       </Connect>
@@ -94,11 +88,11 @@ app.post("/incoming-call", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// --- WEBSOCKET ---
+// WEBSOCKET
 const wss = new WebSocketServer({ server, path: "/connection" });
 
 wss.on("connection", (ws) => {
-  console.log("✅ Twilio Media Stream Connected");
+  console.log("✅ Twilio Connected");
 
   const gemini = new GeminiService(
     (data) => broadcastToFrontend("transcript", data),
@@ -123,7 +117,7 @@ wss.on("connection", (ws) => {
         gemini.endSession();
       }
     } catch (error) {
-      console.error("WS Parsing Error:", error);
+      console.error("WS Error:", error);
     }
   });
 
