@@ -32,15 +32,10 @@ oauth2Client.setCredentials({
 
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-// --- CALENDAR MAPPING (Using your existing Azure Variables) ---
+// --- CALENDAR MAPPING ---
 const calendarIds = {
-  // If the AI says "Jason", put it on Barber 2's calendar
   "Jason": process.env.CALENDAR_ID_BARBER_2 || "primary",
-  
-  // If the AI says "Mohamed", put it on Barber 1's calendar
   "Mohamed": process.env.CALENDAR_ID_BARBER_1 || "primary",
-  
-  // Safety catch in case AI uses old spelling
   "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary"
 };
 
@@ -78,7 +73,7 @@ app.get("/api/test-calendar", async (req, res) => {
   }
 });
 
-// Fetch appointments from ALL calendars for the dashboard
+// ✅ APPOINTMENTS FIX
 app.get("/api/appointments", async (req, res) => {
   try {
     const events = [];
@@ -88,7 +83,6 @@ app.get("/api/appointments", async (req, res) => {
     ];
 
     for (const cal of calendarsToCheck) {
-        // Skip if it's just "primary" to avoid duplicates, unless you only have primary
         if (cal.id === 'primary' && cal.name === 'Jason') continue; 
 
         try {
@@ -100,13 +94,26 @@ app.get("/api/appointments", async (req, res) => {
                 orderBy: 'startTime',
             });
             
-            const mapped = response.data.items.map(event => ({
-                id: event.id,
-                customerName: event.summary || "Busy",
-                barber: cal.name, // This tells the dashboard which column to put it in
-                date: new Date(event.start.dateTime).toLocaleDateString('bg-BG'),
-                time: new Date(event.start.dateTime).toLocaleTimeString('bg-BG', { hour: '2-digit', minute: '2-digit' })
-            }));
+            const mapped = response.data.items.map(event => {
+                // Parse Summary "Service - Name"
+                const summary = event.summary || "Busy";
+                let service = summary;
+                let clientName = "";
+                
+                if (summary.includes(" - ")) {
+                    const parts = summary.split(" - ");
+                    service = parts[0];
+                    clientName = parts[1];
+                }
+
+                return {
+                    id: event.id,
+                    barber: cal.name,
+                    service: service,     // Fixes "undefined" service
+                    clientName: clientName, // Fixes client name display
+                    dateTime: event.start.dateTime || event.start.date // Fixes "Invalid Date"
+                };
+            });
             events.push(...mapped);
         } catch (e) { console.error(`Error fetching ${cal.name}:`, e.message); }
     }
@@ -137,7 +144,7 @@ wss.on("connection", (ws) => {
     (d) => broadcastToFrontend("log", d),
     () => broadcastToFrontend("appointment_update", { message: "Booked!" }),
     oauth2Client,
-    calendarIds // Passing the mapped IDs here
+    calendarIds
   );
 
   ws.on("message", (message) => {
