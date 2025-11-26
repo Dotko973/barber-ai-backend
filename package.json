@@ -11,13 +11,14 @@
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
-    "@google/generative-ai": "^0.14.0",
+    "@google/generative-ai": "^0.14.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "encodeurl": "^2.0.0",
     "express": "^4.19.2",
     "google-auth-library": "^9.11.0",
     "googleapis": "^126.0.1",
+    "readline-sync": "^1.4.10",
     "twilio": "^5.10.4",
     "ws": "^8.18.3"
   },
