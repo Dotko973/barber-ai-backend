@@ -6,7 +6,7 @@ const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO ENGINE (High-Fidelity G.711)
+// AUDIO ENGINE
 // =================================================================
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
@@ -20,23 +20,15 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
-// 1. UPSAMPLING (Twilio 8k -> Gemini 16k) - SMOOTH
 function processTwilioAudio(buffer) {
-    const len = buffer.length;
-    const pcm16k = new Int16Array(len * 2);
-    for (let i = 0; i < len - 1; i++) {
-        const s1 = muLawToPcmTable[buffer[i]];
-        const s2 = muLawToPcmTable[buffer[i+1]];
-        pcm16k[i * 2] = s1;
-        pcm16k[i * 2 + 1] = (s1 + s2) >> 1; 
+    const pcm16k = new Int16Array(buffer.length * 2);
+    for (let i = 0; i < buffer.length; i++) {
+        const s = muLawToPcmTable[buffer[i]];
+        pcm16k[i * 2] = s; pcm16k[i * 2 + 1] = s;
     }
-    const last = muLawToPcmTable[buffer[len-1]];
-    pcm16k[len*2 - 2] = last;
-    pcm16k[len*2 - 1] = last;
     return Buffer.from(pcm16k.buffer);
 }
 
-// 2. DOWNSAMPLING (Gemini 24k -> Twilio 8k)
 function processGeminiAudio(chunkBase64) {
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
     const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
@@ -93,22 +85,18 @@ export class GeminiService {
                         system_instruction: {
                             parts: [{ text: `
                                 Ти си Ема, телефонен AI рецепционист в "Gentleman’s Choice Barbershop".
-                                Говориш само на български език. Тонът ти е лек и професионален.
+                                Говориш само на български език.
 
-                                ВАЖНО ЗА БРЪСНАРИТЕ:
-                                - Имаме двама бръснари: "Jason" (Джейсън) и "Mohamed" (Мохамед).
-                                - Ако клиентът каже "Джейсън", използвай tool параметър 'barber': "Jason".
-                                - Ако клиентът каже "Мохамед", използвай tool параметър 'barber': "Mohamed".
-                                - Ако клиентът няма предпочитания, избери "Jason" по подразбиране.
-
-                                ТВОЯТ СЦЕНАРИЙ:
+                                ВАЖНО:
+                                - Имаме САМО двама бръснари: "Jason" и "Muhammed".
+                                - Ако клиентът каже "Мохамед", разбери го като "Muhammed".
+                                
+                                СЦЕНАРИЙ:
                                 1. Поздрави: "Здравейте, благодарим, че се обадихте в Gentleman’s Choice Barbershop. С какво мога да ви помогна?"
-                                2. Разбери услугата (подстрижка, брада, комбо) и бръснаря.
-                                3. Попитай за ден и час.
-                                4. Използвай 'getAvailableSlots' за да провериш.
-                                5. Предложи час.
-                                6. Поискай името на клиента.
-                                7. Използвай 'bookAppointment' за да запишеш.
+                                2. Разбери услугата и бръснаря (Jason или Muhammed).
+                                3. Провери графика (getAvailableSlots).
+                                4. Предложи час.
+                                5. Запиши час (bookAppointment).
                                 
                                 Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.
                             ` }]
@@ -118,12 +106,12 @@ export class GeminiService {
                                 function_declarations: [
                                     {
                                         name: "getAvailableSlots",
-                                        description: "Check calendar availability.",
+                                        description: "Check calendar for free slots.",
                                         parameters: {
                                             type: "OBJECT",
                                             properties: { 
                                                 date: { type: "STRING", description: "YYYY-MM-DD" }, 
-                                                barber: { type: "STRING", enum: ["Jason", "Muhammed"], description: "Strictly 'Jason' or 'Muhammed'" } 
+                                                barber: { type: "STRING", enum: ["Jason", "Muhammed"] } 
                                             },
                                             required: ["date", "barber"]
                                         }
@@ -134,8 +122,8 @@ export class GeminiService {
                                         parameters: {
                                             type: "OBJECT",
                                             properties: { 
-                                                dateTime: { type: "STRING", description: "ISO 8601" }, 
-                                                duration: { type: "NUMBER", description: "Minutes" },
+                                                dateTime: { type: "STRING" }, 
+                                                duration: { type: "NUMBER" },
                                                 barber: { type: "STRING", enum: ["Jason", "Muhammed"] }, 
                                                 service: { type: "STRING" }, 
                                                 clientName: { type: "STRING" } 
@@ -150,10 +138,10 @@ export class GeminiService {
                 };
                 this.geminiWs.send(JSON.stringify(setup));
                 
-                // KICKSTART TRIGGER
+                // KICKSTART
                 this.geminiWs.send(JSON.stringify({
                     client_content: {
-                        turns: [{ role: "user", parts: [{ text: "Здравей. Започни разговора." }] }],
+                        turns: [{ role: "user", parts: [{ text: "Телефонът звъни. Вдигни и кажи поздрава." }] }],
                         turn_complete: true
                     }
                 }));
@@ -185,21 +173,13 @@ export class GeminiService {
 
     async handleFunctionCall(toolCall) {
         for (const fc of toolCall.functionCalls) {
-            this.log(`Tool: ${fc.name} (${JSON.stringify(fc.args)})`);
+            this.log(`Tool: ${fc.name} [${JSON.stringify(fc.args)}]`);
             let result = { result: "Success" };
             
             if (fc.name === 'getAvailableSlots') result = await this.getAvailableSlots(fc.args);
             else if (fc.name === 'bookAppointment') result = await this.bookAppointment(fc.args);
 
-            this.geminiWs.send(JSON.stringify({
-                tool_response: {
-                    function_responses: [{
-                        id: fc.id,
-                        name: fc.name,
-                        response: { result: { object_value: result } }
-                    }]
-                }
-            }));
+            this.geminiWs.send(JSON.stringify({ tool_response: { function_responses: [{ id: fc.id, name: fc.name, response: { result: { object_value: result } } }] } }));
         }
     }
 
@@ -207,20 +187,15 @@ export class GeminiService {
         if (!this.geminiWs || this.geminiWs.readyState !== 1) return;
         try {
             const pcm16 = processTwilioAudio(buffer);
-            this.geminiWs.send(JSON.stringify({
-                realtime_input: { mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: pcm16.toString('base64') }] }
-            }));
+            this.geminiWs.send(JSON.stringify({ realtime_input: { media_chunks: [{ mime_type: "audio/pcm;rate=16000", data: pcm16.toString('base64') }] } }));
         } catch (e) {}
     }
 
     endSession() { if (this.geminiWs) this.geminiWs.close(); }
     
-    // --- CALENDAR LOGIC ---
+    // --- CALENDAR ---
     async getAvailableSlots({ date, barber }) {
-        // Map 'Jason'/'Muhammed' to specific Calendar IDs if you have them
-        // For now, defaulting both to primary to ensure it works
         const calendarId = this.calendarIds[barber] || 'primary';
-        
         try {
             const res = await this.googleCalendar.events.list({ 
                 calendarId, 
@@ -229,7 +204,7 @@ export class GeminiService {
                 singleEvents: true 
             });
             const busy = res.data.items.map(e => `${new Date(e.start.dateTime).getHours()}:${new Date(e.start.dateTime).getMinutes()}`);
-            return { status: "success", busy_slots: busy, info: "Shop open 09:00-19:00." };
+            return { status: "success", busy_slots: busy, info: "Shop open 09:00-19:00" };
         } catch (e) { return { error: "Calendar error" }; }
     }
 
@@ -240,12 +215,7 @@ export class GeminiService {
             const end = new Date(start.getTime() + (duration || 30)*60000);
             await this.googleCalendar.events.insert({
                 calendarId,
-                resource: { 
-                    summary: `${service} - ${clientName}`, 
-                    description: `Barber: ${barber}`, 
-                    start: { dateTime: start.toISOString() }, 
-                    end: { dateTime: end.toISOString() } 
-                }
+                resource: { summary: `${service} - ${clientName}`, description: `Barber: ${barber}`, start: { dateTime: start.toISOString() }, end: { dateTime: end.toISOString() } }
             });
             this.onAppointmentsUpdate();
             return { success: true };
