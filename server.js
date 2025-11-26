@@ -35,7 +35,6 @@ const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 // --- CALENDAR MAPPING ---
 const calendarIds = {
   "Jason": process.env.CALENDAR_ID_BARBER_2 || "primary",
-  "Mohamed": process.env.CALENDAR_ID_BARBER_1 || "primary",
   "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary"
 };
 
@@ -78,7 +77,7 @@ app.get("/api/appointments", async (req, res) => {
   try {
     const events = [];
     const calendarsToCheck = [
-        { name: 'Mohamed', id: calendarIds['Mohamed'] },
+        { name: 'Muhammed', id: calendarIds['Muhammed'] },
         { name: 'Jason', id: calendarIds['Jason'] }
     ];
 
