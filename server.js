@@ -63,7 +63,7 @@ app.get("/api/test-calendar", async (req, res) => {
 app.get("/api/appointments", async (req, res) => {
   try {
     const events = [];
-    const targets = [{name: 'Mohamed', id: calendarIds['Mohamed']}, {name: 'Jason', id: calendarIds['Jason']}];
+    const targets = [{name: 'Muhammed', id: calendarIds['Muhammed']}, {name: 'Jason', id: calendarIds['Jason']}];
     
     for (const cal of targets) {
        if(cal.id === 'primary' && cal.name === 'Jason') continue; 
