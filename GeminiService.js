@@ -21,21 +21,13 @@ for (let i=-32768; i<=32767; i++) {
 }
 
 // 1. INPUT: Twilio (8k) -> Gemini (16k) + VOLUME BOOST
-// Using "Duplication" (Zero-Order Hold) creates sharper audio edges
-// which improves Speech-to-Text accuracy for Bulgarian consonants.
 function processTwilioAudio(buffer) {
     const len = buffer.length;
     const pcm16k = new Int16Array(len * 2);
-    
     for (let i = 0; i < len; i++) {
         let s = muLawToPcmTable[buffer[i]];
-
-        // DIGITAL GAIN: Boost volume by 2x
-        s = s * 2; 
-        // Clamp values to avoid cracking
-        if (s > 32767) s = 32767;
-        if (s < -32768) s = -32768;
-
+        s = s * 2; // Volume Boost
+        if (s > 32767) s = 32767; if (s < -32768) s = -32768;
         pcm16k[i * 2] = s; 
         pcm16k[i * 2 + 1] = s;
     }
@@ -73,6 +65,7 @@ export class GeminiService {
     }
 
     setStreamSid(sid) { this.streamSid = sid; }
+
     log(msg, data = "") {
         console.log(`[GEMINI] ${msg}`);
         this.onLog({ id: Date.now(), timestamp: new Date().toLocaleTimeString(), message: msg, data: String(data) });
@@ -95,10 +88,10 @@ export class GeminiService {
                             response_modalities: ["AUDIO"], 
                             speech_config: { voice_config: { prebuilt_voice_config: { voice_name: 'Aoede' } } }
                         },
-                        // SYSTEM INSTRUCTIONS (Your Exact Bulgarian Logic)
+                        // FULL BULGARIAN SYSTEM INSTRUCTION
                         system_instruction: {
                             parts: [{ text: `
-                                Ти си Ема, телефонен AI рецепционист в "Gentleman’s Choice Barbershop".
+                                Ти си телефонен AI рецепционист в "Gentleman’s Choice Barbershop".
                                 Отговаряш на обаждания по естествен, приятелски и неформален начин.
                                 Говориш само на български.
                                 Не казвай, че си изкуствен интелект.
@@ -107,22 +100,18 @@ export class GeminiService {
                                 Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.
 
                                 СТЪПКИ НА РАЗГОВОРА:
-                                1. Поздравяваш с приятелски тон и питаш как може да помогнеш ("Здравейте, благодарим, че се обадихте в Gentleman’s Choice Barbershop...").
+                                1. Поздравяваш с приятелски тон и питаш как може да помогнеш.
                                 2. Разбираш каква услуга желае клиентът:
                                    - Подстрижка (30 мин)
                                    - Оформяне на брада (20 мин)
-                                   - Комбо (45 мин) - Ако поискат двете, обясни, че е комбо.
-                                3. Питаш за предпочитан бръснар (Jason, Muhammed или без значение).
+                                   - Комбо (45 мин)
+                                3. Питаш за предпочитан бръснар (Jason или Muhammed). Ако нямат предпочитание, избери Jason.
                                 4. Питаш за ден и час.
                                 5. Проверяваш 'getAvailableSlots'. Ако часът е зает, предложи най-близкия свободен.
                                 6. Когато предложиш час, винаги питай: "Този час устройва ли ви?"
                                 7. След като потвърдят, поискай Името и Фамилията.
                                 8. Използвай 'bookAppointment' за да запишеш часа.
                                 9. Потвърди и затвори с позитивно послание.
-
-                                ВАЖНО:
-                                - Слушай внимателно. Ако не разбереш, попитай пак.
-                                - Говори кратки и ясни изречения.
                             ` }]
                         },
                         tools: [
@@ -146,8 +135,8 @@ export class GeminiService {
                                         parameters: {
                                             type: "OBJECT",
                                             properties: { 
-                                                dateTime: { type: "STRING", description: "ISO 8601" }, 
-                                                duration: { type: "NUMBER", description: "Duration in minutes" },
+                                                dateTime: { type: "STRING", description: "ISO 8601 Start Time" }, 
+                                                duration: { type: "NUMBER", description: "Duration in minutes (20, 30, 45)" },
                                                 barber: { type: "STRING", enum: ["Jason", "Muhammed"] }, 
                                                 service: { type: "STRING" }, 
                                                 clientName: { type: "STRING" } 
@@ -167,7 +156,7 @@ export class GeminiService {
                     client_content: {
                         turns: [{
                             role: "user",
-                            parts: [{ text: "Телефонът звъни. Вдигни и кажи поздрава от сценария." }]
+                            parts: [{ text: "Телефонът звъни. Вдигни и кажи поздрава." }]
                         }],
                         turn_complete: true
                     }
@@ -185,7 +174,6 @@ export class GeminiService {
         try {
             const msg = JSON.parse(data.toString());
             
-            // Audio
             if (msg.serverContent?.modelTurn?.parts) {
                 for (const part of msg.serverContent.modelTurn.parts) {
                     if (part.inlineData?.data) {
@@ -200,7 +188,6 @@ export class GeminiService {
                     }
                 }
             }
-            // Tools
             if (msg.toolCall) this.handleFunctionCall(msg.toolCall);
         } catch (e) {}
     }
@@ -228,7 +215,6 @@ export class GeminiService {
     handleAudio(buffer) {
         if (!this.geminiWs || this.geminiWs.readyState !== 1) return;
         try {
-            // Use the BOOSTED + CRISP audio processor
             const pcm16 = processTwilioAudio(buffer);
             this.geminiWs.send(JSON.stringify({
                 realtime_input: { media_chunks: [{ mime_type: "audio/pcm;rate=16000", data: pcm16.toString('base64') }] }
@@ -238,22 +224,39 @@ export class GeminiService {
 
     endSession() { if (this.geminiWs) this.geminiWs.close(); }
     
-    // --- CALENDAR LOGIC ---
+    // --- DEBUG CALENDAR LOGIC ---
     async getAvailableSlots({ date, barber }) {
-        const calendarId = this.calendarIds[barber] || 'primary';
+        console.error(`[DEBUG] Checking Slots. Barber: "${barber}". Date: "${date}"`);
+        
+        // Debug: Show what keys we have
+        console.error(`[DEBUG] Available Calendar Keys: ${Object.keys(this.calendarIds).join(", ")}`);
+
+        const calendarId = this.calendarIds[barber];
+        console.error(`[DEBUG] Selected Calendar ID: "${calendarId}"`);
+
+        if (!calendarId) {
+            console.error(`[DEBUG] ERROR: ID is UNDEFINED. Defaulting to primary.`);
+            // Don't fail, just use primary so the user experience continues
+            // calendarId = 'primary'; 
+        }
+
         try {
             const res = await this.googleCalendar.events.list({ 
-                calendarId, 
+                calendarId: calendarId || 'primary', 
                 timeMin: new Date(`${date}T09:00:00`).toISOString(), 
                 timeMax: new Date(`${date}T19:00:00`).toISOString(), 
                 singleEvents: true 
             });
             const busy = res.data.items.map(e => e.start.dateTime);
             return { status: "success", busy_slots: busy };
-        } catch (e) { return { error: "Calendar unavailable" }; }
+        } catch (e) { 
+            console.error(`[DEBUG] Calendar API Error: ${e.message}`);
+            return { error: "Calendar unavailable" }; 
+        }
     }
 
     async bookAppointment({ dateTime, duration, barber, service, clientName }) {
+        console.error(`[DEBUG] Booking for ${barber} at ${dateTime}`);
         const calendarId = this.calendarIds[barber] || 'primary';
         try {
             const start = new Date(dateTime);
@@ -264,6 +267,9 @@ export class GeminiService {
             });
             this.onAppointmentsUpdate();
             return { success: true };
-        } catch (e) { return { error: "Booking failed" }; }
+        } catch (e) { 
+            console.error(`[DEBUG] Booking API Error: ${e.message}`);
+            return { error: "Booking failed" }; 
+        }
     }
 }
