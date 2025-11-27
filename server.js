@@ -24,9 +24,10 @@ const oauth2Client = new google.auth.OAuth2(
 oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-// --- STRICT MAPPING ---
+// --- CALENDAR MAP ---
 const calendarIds = {
   "Jason": process.env.CALENDAR_ID_BARBER_2 || "primary",
+  "Mohamed": process.env.CALENDAR_ID_BARBER_1 || "primary", 
   "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary"
 };
 
@@ -50,23 +51,26 @@ app.get("/api/events", (req, res) => {
 
 app.get("/", (req, res) => res.send("Backend Running"));
 app.get("/api", (req, res) => res.json({ status: "Ready" }));
+
+// ✅ FIXED: Added 'message' property back so dashboard doesn't say "undefined"
 app.get("/api/test-calendar", async (req, res) => {
-  try { await calendar.calendarList.list(); res.json({ success: true }); } 
+  try { 
+      await calendar.calendarList.list(); 
+      res.json({ success: true, message: "Google Calendar is connected!" }); 
+  } 
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/appointments", async (req, res) => {
   try {
     const events = [];
-    // Check strict keys: Muhammed and Jason
-    const targets = [{name: 'Muhammed', id: calendarIds['Muhammed']}, {name: 'Jason', id: calendarIds['Jason']}];
+    const targets = [{name: 'Mohamed', id: calendarIds['Mohamed']}, {name: 'Jason', id: calendarIds['Jason']}];
     
     for (const cal of targets) {
        if(cal.id === 'primary' && cal.name === 'Jason') continue; 
        try {
          const res = await calendar.events.list({ calendarId: cal.id, timeMin: new Date().toISOString(), maxResults: 5, singleEvents: true, orderBy: 'startTime' });
          events.push(...res.data.items.map(e => {
-             // Parse "Service - Name"
              const summary = e.summary || "Busy";
              let service = summary;
              let clientName = "";
