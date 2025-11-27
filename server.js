@@ -27,7 +27,6 @@ const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 // --- CALENDAR MAP ---
 const calendarIds = {
   "Jason": process.env.CALENDAR_ID_BARBER_2 || "primary",
-  "Mohamed": process.env.CALENDAR_ID_BARBER_1 || "primary", 
   "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary"
 };
 
