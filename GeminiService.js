@@ -6,13 +6,17 @@ const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO ENGINE (G.711 + Volume Boost)
+// AUDIO ENGINE (Hybrid: G.711 Decode + Manager's Smooth Math)
 // =================================================================
+
+// 1. DECODE TABLE (Required for Twilio)
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
     let u=~i&0xff, s=(u&0x80)?-1:1, e=(u>>4)&0x07, m=u&0x0f;
     let v=((m<<1)+1)<<(e+2); v-=132; muLawToPcmTable[i]=s*v;
 }
+
+// 2. ENCODE TABLE (Required for Twilio)
 const pcmToMuLawMap = new Int8Array(65536);
 for (let i=-32768; i<=32767; i++) {
     let s=i, si=(s>>8)&0x80; if(s<0)s=-s; s+=132; if(s>32767)s=32767;
@@ -20,19 +24,35 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
+// 3. INPUT: Twilio (8k) -> Gemini (16k) 
+// USING MANAGER'S "SMOOTH" MATH (Linear Interpolation)
 function processTwilioAudio(buffer) {
     const len = buffer.length;
     const pcm16k = new Int16Array(len * 2);
-    for (let i = 0; i < len; i++) {
-        let s = muLawToPcmTable[buffer[i]];
-        s = s * 2; // Volume Boost
-        if (s > 32767) s = 32767; if (s < -32768) s = -32768;
-        pcm16k[i * 2] = s; 
-        pcm16k[i * 2 + 1] = s;
+    
+    for (let i = 0; i < len - 1; i++) {
+        // Decode MuLaw first (Twilio Requirement)
+        let s1 = muLawToPcmTable[buffer[i]];
+        let s2 = muLawToPcmTable[buffer[i+1]];
+
+        // VOLUME BOOST (2x) - Helps AI hear Bulgarian consonants
+        s1 = s1 * 2; if(s1 > 32767) s1=32767; if(s1 < -32768) s1=-32768;
+        s2 = s2 * 2; if(s2 > 32767) s2=32767; if(s2 < -32768) s2=-32768;
+
+        // Manager's Logic: Interpolate between points
+        pcm16k[i * 2] = s1;
+        pcm16k[i * 2 + 1] = (s1 + s2) >> 1; // The "Smooth" factor
     }
+    
+    // Handle last sample
+    const last = muLawToPcmTable[buffer[len-1]] * 2;
+    pcm16k[len*2 - 2] = last;
+    pcm16k[len*2 - 1] = last;
+
     return Buffer.from(pcm16k.buffer);
 }
 
+// 4. OUTPUT: Gemini (24k) -> Twilio (8k)
 function processGeminiAudio(chunkBase64) {
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
     const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
@@ -85,45 +105,49 @@ export class GeminiService {
                             response_modalities: ["AUDIO"], 
                             speech_config: { voice_config: { prebuilt_voice_config: { voice_name: 'Aoede' } } }
                         },
+                        // YOUR STRICT BULGARIAN LOGIC
                         system_instruction: {
                             parts: [{ text: `
                                 Ти си Ема, телефонен AI рецепционист в "Gentleman’s Choice Barbershop".
-                                
-                                ИЗИСКВАНИЯ ЗА ГОВОР (СТРИКТНО):
-                                1. Говори САМО на чист, правилен Български език. Без руски или английски акцент.
-                                2. Когато казваш името на салона, произнасяй го като "Джентълменс Чойс".
-                                3. Всички дати и часове трябва да се произнасят на български (пример: не "ten thirty", а "десет и тридесет").
-                                4. Използвай кратки, ясни изречения.
+                                Говориш само на български език.
 
-                                ТВОЯТ СЦЕНАРИЙ:
-                                1. Поздрави точно така: "Добър ден, благодаря че се обадихте в Gentleman's Choice Barbershop. Аз съм Ема с какво мога да ви помогна днес?"
-                                2. Разбери услугата (подстрижка 30мин, брада 20мин, комбо 45мин).
-                                3. Разбери бръснаря (Jason или Muhammed).
-                                4. Попитай за ден и час.
-                                5. Провери графика (getAvailableSlots).
+                                ИЗИСКВАНИЯ:
+                                1. Поздрави: "Здравейте, благодарим, че се обадихте в Gentleman’s Choice Barbershop. С какво мога да ви помогна?"
+                                2. Разбери услугата (подстрижка, брада, комбо).
+                                3. Питаш за предпочитан бръснар (Jason или Muhammed).
+                                4. Питаш за ден и час.
+                                5. Провери 'getAvailableSlots'.
                                 6. Предложи час.
-                                7. Поискай името.
-                                8. Запиши часа (bookAppointment).
+                                7. Поискай име.
+                                8. Запиши (bookAppointment).
                                 
                                 Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.
                             ` }]
                         },
-                        tools: [{ function_declarations: [
-                            { name: "getAvailableSlots", description: "Check slots", parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, barber: { type: "STRING", enum: ["Jason", "Muhammed"] } }, required: ["date", "barber"] } },
-                            { name: "bookAppointment", description: "Book appt", parameters: { type: "OBJECT", properties: { dateTime: { type: "STRING" }, duration: { type: "NUMBER" }, barber: { type: "STRING", enum: ["Jason", "Muhammed"] }, service: { type: "STRING" }, clientName: { type: "STRING" } }, required: ["dateTime", "duration", "barber", "service", "clientName"] } }
-                        ]}]
+                        tools: [
+                            {
+                                function_declarations: [
+                                    {
+                                        name: "getAvailableSlots",
+                                        description: "Check slots",
+                                        parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, barber: { type: "STRING", enum: ["Jason", "Muhammed"] } }, required: ["date", "barber"] }
+                                    },
+                                    {
+                                        name: "bookAppointment",
+                                        description: "Book appt",
+                                        parameters: { type: "OBJECT", properties: { dateTime: { type: "STRING" }, duration: { type: "NUMBER" }, barber: { type: "STRING", enum: ["Jason", "Muhammed"] }, service: { type: "STRING" }, clientName: { type: "STRING" } }, required: ["dateTime", "duration", "barber", "service", "clientName"] }
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setup));
                 
-                // 2. KICKSTART (Force Exact Greeting)
+                // KICKSTART (Required for WebSocket to start flow)
                 this.geminiWs.send(JSON.stringify({
                     client_content: {
-                        turns: [{
-                            role: "user",
-                            // We instruct the model that the call has started, so it says the greeting defined in Step 1
-                            parts: [{ text: "Обаждането започна. Кажи встъпителния поздрав." }]
-                        }],
+                        turns: [{ role: "user", parts: [{ text: "Обаждането започна. Кажи встъпителния поздрав." }] }],
                         turn_complete: true
                     }
                 }));
@@ -172,6 +196,7 @@ export class GeminiService {
             }));
         } catch (e) {}
     }
+
     endSession() { if (this.geminiWs) this.geminiWs.close(); }
     
     async getAvailableSlots({ date, barber }) {
@@ -180,7 +205,7 @@ export class GeminiService {
             const res = await this.googleCalendar.events.list({ calendarId, timeMin: new Date(`${date}T09:00:00`).toISOString(), timeMax: new Date(`${date}T19:00:00`).toISOString(), singleEvents: true });
             const busy = res.data.items.map(e => e.start.dateTime);
             return { status: "success", busy_slots: busy };
-        } catch (e) { return { error: "Calendar error" }; }
+        } catch (e) { return { error: "Calendar unavailable" }; }
     }
 
     async bookAppointment({ dateTime, duration, barber, service, clientName }) {
