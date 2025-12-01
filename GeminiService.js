@@ -6,17 +6,13 @@ const MODEL_NAME = 'models/gemini-2.0-flash-exp';
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 // =================================================================
-// AUDIO ENGINE (Hybrid: G.711 Decode + Manager's Smooth Math)
+// AUDIO ENGINE (High-Fidelity G.711 + Volume Boost)
 // =================================================================
-
-// 1. DECODE TABLE (Required for Twilio)
 const muLawToPcmTable = new Int16Array(256);
 for (let i=0; i<256; i++) {
     let u=~i&0xff, s=(u&0x80)?-1:1, e=(u>>4)&0x07, m=u&0x0f;
     let v=((m<<1)+1)<<(e+2); v-=132; muLawToPcmTable[i]=s*v;
 }
-
-// 2. ENCODE TABLE (Required for Twilio)
 const pcmToMuLawMap = new Int8Array(65536);
 for (let i=-32768; i<=32767; i++) {
     let s=i, si=(s>>8)&0x80; if(s<0)s=-s; s+=132; if(s>32767)s=32767;
@@ -24,35 +20,21 @@ for (let i=-32768; i<=32767; i++) {
     let man=(s>>(e+3))&0x0F; pcmToMuLawMap[i+32768]=~(si|(e<<4)|man);
 }
 
-// 3. INPUT: Twilio (8k) -> Gemini (16k) 
-// USING MANAGER'S "SMOOTH" MATH (Linear Interpolation)
+// 1. INPUT: Twilio (8k) -> Gemini (16k) + VOLUME BOOST
 function processTwilioAudio(buffer) {
     const len = buffer.length;
     const pcm16k = new Int16Array(len * 2);
-    
-    for (let i = 0; i < len - 1; i++) {
-        // Decode MuLaw first (Twilio Requirement)
-        let s1 = muLawToPcmTable[buffer[i]];
-        let s2 = muLawToPcmTable[buffer[i+1]];
-
-        // VOLUME BOOST (2x) - Helps AI hear Bulgarian consonants
-        s1 = s1 * 2; if(s1 > 32767) s1=32767; if(s1 < -32768) s1=-32768;
-        s2 = s2 * 2; if(s2 > 32767) s2=32767; if(s2 < -32768) s2=-32768;
-
-        // Manager's Logic: Interpolate between points
-        pcm16k[i * 2] = s1;
-        pcm16k[i * 2 + 1] = (s1 + s2) >> 1; // The "Smooth" factor
+    for (let i = 0; i < len; i++) {
+        let s = muLawToPcmTable[buffer[i]];
+        s = s * 2; // Volume Boost
+        if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+        pcm16k[i * 2] = s; 
+        pcm16k[i * 2 + 1] = s;
     }
-    
-    // Handle last sample
-    const last = muLawToPcmTable[buffer[len-1]] * 2;
-    pcm16k[len*2 - 2] = last;
-    pcm16k[len*2 - 1] = last;
-
     return Buffer.from(pcm16k.buffer);
 }
 
-// 4. OUTPUT: Gemini (24k) -> Twilio (8k)
+// 2. OUTPUT: Gemini (24k) -> Twilio (8k)
 function processGeminiAudio(chunkBase64) {
     const srcBuffer = Buffer.from(chunkBase64, 'base64');
     const srcSamples = new Int16Array(srcBuffer.buffer, srcBuffer.byteOffset, srcBuffer.length / 2);
@@ -105,49 +87,49 @@ export class GeminiService {
                             response_modalities: ["AUDIO"], 
                             speech_config: { voice_config: { prebuilt_voice_config: { voice_name: 'Aoede' } } }
                         },
-                        // YOUR STRICT BULGARIAN LOGIC
+                        // SYSTEM INSTRUCTIONS WITH PRONUNCIATION RULES
                         system_instruction: {
                             parts: [{ text: `
-                                Ти си Ема, телефонен AI рецепционист в "Gentleman’s Choice Barbershop".
-                                Говориш само на български език.
+                                Ти си Ема, телефонен рецепционист в "Gentleman’s Choice Barbershop" (произнасяй го: "Джентълменс Чойс").
+                                Говориш само на български.
 
-                                ИЗИСКВАНИЯ:
-                                1. Поздрави: "Здравейте, благодарим, че се обадихте в Gentleman’s Choice Barbershop. С какво мога да ви помогна?"
+                                ВАЖНО: ПРАВИЛА ЗА ИЗГОВАРЯНЕ НА ЧИСЛА И ДАТИ:
+                                1. НИКОГА не използвай цифри (10:30, 15.12) в речта си.
+                                2. ВИНАГИ изписвай числата с думи на български.
+                                   - Вместо "10:00", кажи "десет часа".
+                                   - Вместо "14:30", кажи "четиринадесет и тридесет".
+                                   - Вместо "15 Декември", кажи "петнадесети декември".
+                                3. Ако не го направиш, ще прозвучиш на английски, което е забранено.
+
+                                СЦЕНАРИЙ:
+                                1. Поздрави: "Добър ден, благодаря че се обадихте в Джентълменс Чойс. Аз съм Ема с какво мога да ви помогна днес?"
                                 2. Разбери услугата (подстрижка, брада, комбо).
-                                3. Питаш за предпочитан бръснар (Jason или Muhammed).
-                                4. Питаш за ден и час.
-                                5. Провери 'getAvailableSlots'.
-                                6. Предложи час.
-                                7. Поискай име.
-                                8. Запиши (bookAppointment).
+                                3. Разбери бръснаря (Jason или Muhammed).
+                                4. Попитай за ден и час.
+                                5. Провери графика (getAvailableSlots).
+                                6. Предложи час (използвайки ДУМИ, не цифри).
+                                7. Поискай името.
+                                8. Запиши часа (bookAppointment).
+                                9. Потвърди.
                                 
                                 Днешната дата е ${new Date().toLocaleDateString('bg-BG')}.
                             ` }]
                         },
-                        tools: [
-                            {
-                                function_declarations: [
-                                    {
-                                        name: "getAvailableSlots",
-                                        description: "Check slots",
-                                        parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, barber: { type: "STRING", enum: ["Jason", "Muhammed"] } }, required: ["date", "barber"] }
-                                    },
-                                    {
-                                        name: "bookAppointment",
-                                        description: "Book appt",
-                                        parameters: { type: "OBJECT", properties: { dateTime: { type: "STRING" }, duration: { type: "NUMBER" }, barber: { type: "STRING", enum: ["Jason", "Muhammed"] }, service: { type: "STRING" }, clientName: { type: "STRING" } }, required: ["dateTime", "duration", "barber", "service", "clientName"] }
-                                    }
-                                ]
-                            }
-                        ]
+                        tools: [{ function_declarations: [
+                            { name: "getAvailableSlots", description: "Check slots", parameters: { type: "OBJECT", properties: { date: { type: "STRING" }, barber: { type: "STRING", enum: ["Jason", "Mohamed"] } }, required: ["date", "barber"] } },
+                            { name: "bookAppointment", description: "Book appt", parameters: { type: "OBJECT", properties: { dateTime: { type: "STRING" }, duration: { type: "NUMBER" }, barber: { type: "STRING", enum: ["Jason", "Mohamed"] }, service: { type: "STRING" }, clientName: { type: "STRING" } }, required: ["dateTime", "duration", "barber", "service", "clientName"] } }
+                        ]}]
                     }
                 };
                 this.geminiWs.send(JSON.stringify(setup));
                 
-                // KICKSTART (Required for WebSocket to start flow)
+                // KICKSTART
                 this.geminiWs.send(JSON.stringify({
                     client_content: {
-                        turns: [{ role: "user", parts: [{ text: "Обаждането започна. Кажи встъпителния поздрав." }] }],
+                        turns: [{
+                            role: "user",
+                            parts: [{ text: "Телефонът звъни. Вдигни и кажи поздрава от сценария точно както е написан." }]
+                        }],
                         turn_complete: true
                     }
                 }));
