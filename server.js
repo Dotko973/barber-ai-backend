@@ -3,9 +3,11 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 
+// Initialize Express App
 const app = express();
 
 // --- MIDDLEWARE ---
+// Allow specific origins or true for all (Debugging mode)
 app.use(cors({ origin: true })); 
 app.use(bodyParser.json());
 
@@ -26,15 +28,17 @@ const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 const calendarIds = {
   "Jason": process.env.CALENDAR_ID_BARBER_2 || "primary",
   "Mohamed": process.env.CALENDAR_ID_BARBER_1 || "primary",
-  "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary" // Safety fallback
+  "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary"
 };
 
 // --- DASHBOARD LIVE UPDATES (SSE) ---
 let sseClients = [];
+
 function broadcast(type, data) {
   sseClients.forEach(client => {
+    // Check if connection is still open before writing
     if (!client.res.writableEnded) {
-      client.res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
+        client.res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
     }
   });
 }
@@ -43,6 +47,7 @@ app.get("/api/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  
   if (res.flushHeaders) res.flushHeaders();
   
   const clientId = Date.now();
@@ -51,10 +56,12 @@ app.get("/api/events", (req, res) => {
   // Initial message to turn dashboard Green
   res.write(`data: ${JSON.stringify({ type: "log", data: { message: "Connected to Vapi Backend" } })}\n\n`);
   
-  req.on("close", () => sseClients = sseClients.filter(c => c.id !== clientId));
+  req.on("close", () => {
+      sseClients = sseClients.filter(c => c.id !== clientId);
+  });
 });
 
-// --- STANDARD API ROUTES (For Dashboard) ---
+// --- STANDARD API ROUTES ---
 app.get("/", (req, res) => res.send("Barbershop Vapi Backend Running"));
 app.get("/api", (req, res) => res.json({ status: "Vapi Backend Ready" }));
 
@@ -68,7 +75,7 @@ app.get("/api/test-calendar", async (req, res) => {
     }
 });
 
-// Appointments List
+// Appointments List (Fixes Dashboard 404s)
 app.get("/api/appointments", async (req, res) => {
     try {
         const events = [];
@@ -97,14 +104,16 @@ app.get("/api/appointments", async (req, res) => {
 });
 
 // =================================================================
-// 🚀 VAPI TOOL HANDLERS (The New Logic)
+// 🚀 VAPI TOOL HANDLERS
 // =================================================================
 
 // Tool 1: checkAvailability
 app.post("/api/vapi/check-slots", async (req, res) => {
   try {
-      // Vapi sends arguments inside message.toolCalls
-      const toolCall = req.body.message.toolCalls[0];
+      // Safety check for Vapi payload structure
+      const toolCall = req.body.message?.toolCalls?.[0];
+      if (!toolCall) return res.status(400).send("No tool call found");
+
       const { date, barber } = toolCall.function.arguments;
       
       console.log(`[VAPI] Checking slots for ${barber} on ${date}`);
@@ -122,14 +131,11 @@ app.post("/api/vapi/check-slots", async (req, res) => {
           orderBy: 'startTime'
       });
       
-      // Calculate BUSY times
       const busySlots = response.data.items.map(e => {
           const s = new Date(e.start.dateTime);
-          const end = new Date(e.end.dateTime);
-          return `${s.getHours()}:${s.getMinutes().toString().padStart(2,'0')} - ${end.getHours()}:${end.getMinutes().toString().padStart(2,'0')}`;
+          return `${s.getHours()}:${s.getMinutes().toString().padStart(2,'0')}`;
       });
 
-      // Send result back to Vapi
       res.json({
           results: [{
               toolCallId: toolCall.id,
@@ -149,7 +155,9 @@ app.post("/api/vapi/check-slots", async (req, res) => {
 // Tool 2: bookAppointment
 app.post("/api/vapi/book", async (req, res) => {
   try {
-      const toolCall = req.body.message.toolCalls[0];
+      const toolCall = req.body.message?.toolCalls?.[0];
+      if (!toolCall) return res.status(400).send("No tool call found");
+
       const { dateTime, duration, barber, service, clientName } = toolCall.function.arguments;
 
       console.log(`[VAPI] Booking ${clientName} with ${barber} at ${dateTime}`);
@@ -170,7 +178,6 @@ app.post("/api/vapi/book", async (req, res) => {
           }
       });
 
-      // Notify Dashboard
       broadcast("appointment_update", { message: "Booked!" });
 
       res.json({
@@ -185,12 +192,9 @@ app.post("/api/vapi/book", async (req, res) => {
   }
 });
 
-// --- VAPI WEBHOOK (For Live Transcripts) ---
-// You need to set this URL in Vapi Assistant Settings -> "Server URL"
+// --- VAPI WEBHOOK (Transcripts) ---
 app.post("/api/vapi/webhook", (req, res) => {
     const msg = req.body.message;
-    
-    // Check if it's a transcript message
     if (msg && msg.type === "transcript" && msg.transcriptType === "final") {
         broadcast("transcript", { 
             id: Date.now(), 
@@ -198,15 +202,16 @@ app.post("/api/vapi/webhook", (req, res) => {
             text: msg.transcript 
         });
     }
-    
     res.sendStatus(200);
 });
 
 // ===============================
-// START SERVER
+// START SERVER (FIXED)
 // ===============================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+
+// FIX: Changed 'server.listen' to 'app.listen' because we are not using http.createServer anymore
+app.listen(PORT, () => {
   console.log(`✅ Barbershop Vapi Backend running on port ${PORT}`);
 });
 
