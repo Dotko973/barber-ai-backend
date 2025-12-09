@@ -27,7 +27,6 @@ const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 // --- CALENDAR MAPPING ---
 const calendarIds = {
   "Jason": process.env.CALENDAR_ID_BARBER_2 || "primary",
-  "Mohamed": process.env.CALENDAR_ID_BARBER_1 || "primary",
   "Muhammed": process.env.CALENDAR_ID_BARBER_1 || "primary"
 };
 
@@ -64,6 +63,23 @@ app.get("/api/events", (req, res) => {
 // --- STANDARD API ROUTES ---
 app.get("/", (req, res) => res.send("Barbershop Vapi Backend Running"));
 app.get("/api", (req, res) => res.json({ status: "Vapi Backend Ready" }));
+
+// 🔔 TWILIO INCOMING CALL WEBHOOK → VAPI ASSISTANT
+// Twilio is configured to POST here on incoming calls.
+app.post("/incoming-call", (req, res) => {
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://api.vapi.ai/twilio/stream">
+      <Parameter name="assistantId" value="${process.env.VAPI_ASSISTANT_ID}" />
+      <Parameter name="apiKey" value="${process.env.VAPI_PRIVATE_KEY}" />
+    </Stream>
+  </Connect>
+</Response>`;
+
+  res.type("text/xml");
+  res.send(twiml);
+});
 
 // Calendar Test Button
 app.get("/api/test-calendar", async (req, res) => {
