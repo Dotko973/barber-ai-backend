@@ -12,6 +12,7 @@
   "dependencies": {
     "@google/genai": "^1.30.0",
     "@google/generative-ai": "^0.14.1",
+    "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "encodeurl": "^2.0.0",
